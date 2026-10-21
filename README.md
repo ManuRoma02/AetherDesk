@@ -9,69 +9,59 @@ Soluzione di controllo remoto leggera, ultra-veloce e 100% gratuita per Windows.
 - **Accesso Non Presidiato (Unattended)**: Si avvia automaticamente all'accensione del PC fisso prima ancora del login (`StartupType = Automatic`). Puoi accendere il PC ed effettuare il login Windows direttamente da remoto.
 - **Tutti i Permessi Sempre (UAC & Winlogon)**: Non si blocca mai sui prompt di amministratore (UAC) o schermate di sistema protette grazie all'aggancio dinamico a `OpenInputDesktop` e all'iniezione con `SendInput`.
 - **Prevenzione Standby Automatica**: Il computer fisso non va in sospensione né spegne la sessione interattiva mentre sei fuori casa (`SetThreadExecutionState`).
+- **Sincronizzazione Appunti Bidirezionale**: Fai `Ctrl+C` sul portatile e incolli con `Ctrl+V` sul fisso (e viceversa). Ideale per codice, comandi e testi di studio.
+- **Supporto Multi-Monitor**: Se sul fisso hai più schermi, puoi passare al volo da un monitor all'altro (Monitor 1, Monitor 2) oppure visualizzare tutti i monitor contemporaneamente (*Desktop Virtuale*).
+- **Trasferimento File Integrato**: Invia documenti, compiti, PDF o file `.zip` dal portatile al fisso con un clic tramite il pulsante *"Invia File"* (i file vengono salvati automaticamente in `Download\RemoteDesktop_Transfers`).
+- **Eseguibile Autonomo Standalone (.EXE)**: Include `dist\RemoteClient.exe`, un unico file eseguibile senza dipendenze né bisogno di installare Python, pronto per essere portato su chiavetta USB e usato su qualsiasi computer.
 - **Autenticazione Semplice & Sicura**: Connessione tramite **ID univoco a 9 cifre** (es. `482 910 234`) e password personale.
-- **Crittografia End-to-End (Zero-Knowledge E2EE)**: Tutti i frame video e gli input di tastiera e mouse sono cifrati con standard militare **AES-256-GCM** e chiavi derivate tramite **PBKDF2-SHA256**.
-- **100% Gratuito & Leggero**: Nessun abbonamento, nessun server VPS a pagamento, nessun limite di tempo (mai più disconnessioni dopo 5 minuti).
+- **Crittografia End-to-End (Zero-Knowledge E2EE)**: Tutti i frame video, gli input, gli appunti e i file sono protetti con cifratura militare **AES-256-GCM** e chiavi derivate tramite **PBKDF2-SHA256**.
+- **100% Gratuito & Illimitato**: Nessun abbonamento, nessun server VPS a pagamento, nessun limite di tempo (mai più disconnessioni dopo 5 minuti).
 
 ---
 
-## Guida Rapida all'Uso
+## Guida all'Uso
 
 ### 1. Sul PC Fisso (Host da controllare)
 
 1. Fai doppio clic su `start_host.bat` per aprire il **Pannello di Controllo Host**.
-2. Vedrai chiaramente il tuo **ID Dispositivo a 9 cifre** (es. `482 910 234`).
+2. Troverai il tuo **ID Dispositivo a 9 cifre** (es. `482 910 234`).
 3. Inserisci la tua password personale nel campo *Password di Accesso Remoto* e premi **Salva Password**.
 4. **Per abilitare l'avvio automatico all'accensione del PC**:
    - Fai clic destro su `scripts\install_service.bat` e seleziona **Esegui come amministratore** (oppure clicca sul pulsante *"Installa come Servizio Windows"* nel pannello).
-   - Fatto! Da questo momento il servizio rimarrà sempre attivo ad ogni riavvio o accensione del computer fisso.
+   - *Fatto!* Il servizio rimarrà sempre attivo ad ogni riavvio o accensione del computer fisso.
 
 ---
 
 ### 2. Sul Portatile (Client da cui controlli)
 
-1. Copia o scarica la cartella sul tuo portatile (puoi tenerla anche su una chiavetta USB).
-2. Fai doppio clic su `start_client.bat`.
-3. Inserisci:
-   - **ID del Computer Fisso** (le 9 cifre generate sul fisso).
-   - **La Password** che hai configurato.
-4. Clicca su **Connetti al Computer**.
-5. Si aprirà immediatamente la finestra del desktop remoto a schermo intero o ridimensionabile:
-   - **Mouse**: Controllo completo del cursore, click sinistro/destro/centrale e rotellina di scorrimento.
-   - **Tastiera**: Inoltro in tempo reale di tutti i tasti e scorciatoie di Windows.
-   - **Barra Superiore**: Pulsanti veloci per inviare scorciatoie speciali (*Invia Ctrl+Alt+Del*, *Mostra Desktop Win+D*, *Schermo Intero*, *Disconnetti*).
+Puoi avviare il client in due modalità:
+- **Metodo 1 (Super portatile)**: Fai doppio clic su `dist\RemoteClient.exe` (non richiede Python, funziona ovunque da chiavetta USB).
+- **Metodo 2 (Script rapido)**: Fai doppio clic su `start_client.bat`.
+
+Una volta aperta l'app:
+1. Inserisci l'**ID del Computer Fisso** e la **Password**.
+2. Clicca su **Connetti al Computer**.
+3. Dalla barra superiore puoi:
+   - **Inviare Ctrl+Alt+Del** o mostrare il desktop (**Win+D**).
+   - **Inviare File**: Clicca su *"Invia File"* per inviare qualsiasi documento o archivio al PC fisso.
+   - **Cambiare Monitor**: Clicca su *1*, *2* o *Tutti* per cambiare al volo la visualizzazione dello schermo.
+   - **Copia/Incolla**: Funziona automaticamente in tempo reale in background.
 
 ---
 
-## Struttura del Progetto
+## Compilare l'Eseguibile .EXE
 
-```
-ScreenMirroring/
-├── start_host.bat           # Launcher rapido pannello PC fisso
-├── start_client.bat         # Launcher rapido viewer portatile
-├── scripts/
-│   ├── install_service.bat  # Installa il servizio di sistema con avvio automatico
-│   └── uninstall_service.bat# Rimuove il servizio di sistema
-├── src/
-│   ├── capture.py           # Cattura GPU Direct3D/GDI con gestione trasparente UAC
-│   ├── input_handler.py     # Iniezione input SendInput elevato e tasti speciali
-│   ├── security.py          # Gestione ID 9 cifre, hashing PBKDF2 e cifratura AES-GCM
-│   ├── protocol.py          # Framing binario ad alta efficienza per stream e comandi
-│   ├── signaling_broker.py  # Broker di rendez-vous a conoscenza zero
-│   ├── host_daemon.py       # Demone di streaming e ricezione comandi
-│   ├── host_service.py      # Entry point per Windows Service (Session 0)
-│   ├── host_tray.py         # Interfaccia grafica Host (ID e gestione password)
-│   ├── client.py            # Modulo di rete e decifratura lato client
-│   └── client_viewer.py     # Finestra interattiva del client con rendering video
-└── tests/                   # Suite completa di test unitari ed End-to-End
+Se modifichi il codice e vuoi rigenerare l'eseguibile autonomo `dist\RemoteClient.exe`:
+```cmd
+scripts\build_exe.bat
 ```
 
 ---
 
 ## Test e Verifica
 
-Per eseguire l'intera suite di test automatizzati:
+Per verificare il funzionamento di tutti i moduli:
 ```bash
 python -m pytest tests/ -v
 ```
-Tutti i 21 test unitari e di integrazione end-to-end vengono eseguiti in meno di 1 secondo con esito 100% positivo.
+Tutti i **25 test unitari ed End-to-End** vengono eseguiti con esito 100% positivo.
