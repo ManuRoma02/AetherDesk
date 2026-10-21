@@ -1,0 +1,236 @@
+import io
+import sys
+import asyncio
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
+
+from src.client import RemoteClient, ClientState
+
+class ClientViewerGUI:
+    """Portable GUI Application for connecting to remote desktop host."""
+
+    def __init__(self, broker_url: str = "ws://127.0.0.1:8765"):
+        self.root = tk.Tk()
+        self.root.title("Remote Desktop Client")
+        self.root.geometry("450x320")
+        self.root.configure(bg="#1e1e2e")
+
+        self.client = RemoteClient(broker_url=broker_url)
+        self.client.on_frame_callback = self._on_frame_received
+        self.client.on_status_callback = self._on_status_update
+
+        self.loop = asyncio.new_event_loop()
+        self.network_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+        self.network_thread.start()
+
+        self.viewer_window = None
+        self.canvas = None
+        self.photo_img = None
+        self.current_img_dims = (0, 0)
+
+        self._build_login_ui()
+
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def _build_login_ui(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background="#1e1e2e", foreground="#89b4fa", font=("Segoe UI", 16, "bold"))
+        style.configure("Status.TLabel", background="#1e1e2e", foreground="#a6adc8", font=("Segoe UI", 9))
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), background="#89b4fa", foreground="#11111b")
+
+        container = tk.Frame(self.root, bg="#1e1e2e", padx=30, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Label(container, text="Controllo Desktop Remoto", style="Header.TLabel")
+        header.pack(pady=(0, 15))
+
+        lbl_id = ttk.Label(container, text="ID Computer Remoto (9 cifre):")
+        lbl_id.pack(anchor="w")
+        self.entry_id = tk.Entry(container, font=("Consolas", 14), justify="center", bg="#313244", fg="#cdd6f4", insertbackground="white")
+        self.entry_id.pack(fill=tk.X, pady=(2, 10), ipady=4)
+        self.entry_id.insert(0, "123 456 789")
+
+        lbl_pwd = ttk.Label(container, text="Password di Accesso:")
+        lbl_pwd.pack(anchor="w")
+        self.entry_pwd = tk.Entry(container, font=("Segoe UI", 12), show="*", bg="#313244", fg="#cdd6f4", insertbackground="white")
+        self.entry_pwd.pack(fill=tk.X, pady=(2, 15), ipady=3)
+
+        self.btn_connect = tk.Button(container, text="Connetti al Computer", bg="#89b4fa", fg="#11111b",
+                                     font=("Segoe UI", 11, "bold"), relief="flat", cursor="hand2", command=self._start_connect)
+        self.btn_connect.pack(fill=tk.X, ipady=6)
+
+        self.lbl_status = ttk.Label(container, text="Pronto alla connessione.", style="Status.TLabel")
+        self.lbl_status.pack(pady=(12, 0))
+
+    def _on_status_update(self, text: str):
+        self.root.after(0, lambda: self.lbl_status.config(text=text))
+
+    def _start_connect(self):
+        dev_id = self.entry_id.get().strip()
+        pwd = self.entry_pwd.get().strip()
+
+        if not ClientState.validate_id(dev_id):
+            messagebox.showerror("Errore ID", "L'ID deve essere composto esattamente da 9 cifre (es. 482 910 234).")
+            return
+
+        self.btn_connect.config(state="disabled", text="Connessione in corso...")
+        asyncio.run_coroutine_threadsafe(self._async_connect_task(dev_id, pwd), self.loop)
+
+    async def _async_connect_task(self, dev_id: str, pwd: str):
+        ok = await self.client.connect(dev_id, pwd)
+        self.root.after(0, lambda: self._handle_connect_result(ok))
+
+    def _handle_connect_result(self, success: bool):
+        self.btn_connect.config(state="normal", text="Connetti al Computer")
+        if success:
+            self._open_viewer_window()
+
+    def _open_viewer_window(self):
+        if self.viewer_window and tk.Toplevel.winfo_exists(self.viewer_window):
+            return
+
+        self.viewer_window = tk.Toplevel(self.root)
+        self.viewer_window.title(f"Desktop Remoto - [{self.client.state.target_id}]")
+        self.viewer_window.geometry("1280x720")
+        self.viewer_window.configure(bg="#000000")
+        self.viewer_window.protocol("WM_DELETE_WINDOW", self._close_viewer)
+
+        # Toolbar
+        toolbar = tk.Frame(self.viewer_window, bg="#181825", height=35)
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+
+        btn_cad = tk.Button(toolbar, text="Invia Ctrl+Alt+Del", bg="#313244", fg="#cdd6f4", relief="flat",
+                            font=("Segoe UI", 9), command=lambda: self._send_special("ctrl_alt_del"))
+        btn_cad.pack(side=tk.LEFT, padx=5, pady=4)
+
+        btn_wind = tk.Button(toolbar, text="Mostra Desktop (Win+D)", bg="#313244", fg="#cdd6f4", relief="flat",
+                             font=("Segoe UI", 9), command=lambda: self._send_special("win_d"))
+        btn_wind.pack(side=tk.LEFT, padx=5, pady=4)
+
+        btn_fs = tk.Button(toolbar, text="Schermo Intero", bg="#313244", fg="#cdd6f4", relief="flat",
+                           font=("Segoe UI", 9), command=self._toggle_fullscreen)
+        btn_fs.pack(side=tk.LEFT, padx=5, pady=4)
+
+        btn_disc = tk.Button(toolbar, text="Disconnetti", bg="#f38ba8", fg="#11111b", relief="flat",
+                             font=("Segoe UI", 9, "bold"), command=self._close_viewer)
+        btn_disc.pack(side=tk.RIGHT, padx=5, pady=4)
+
+        # Video Canvas
+        self.canvas = tk.Canvas(self.viewer_window, bg="#000000", highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Input Bindings
+        self.canvas.bind("<Motion>", self._on_mouse_move)
+        self.canvas.bind("<Button-1>", lambda e: self._on_mouse_btn(e, "left", "down"))
+        self.canvas.bind("<ButtonRelease-1>", lambda e: self._on_mouse_btn(e, "left", "up"))
+        self.canvas.bind("<Button-3>", lambda e: self._on_mouse_btn(e, "right", "down"))
+        self.canvas.bind("<ButtonRelease-3>", lambda e: self._on_mouse_btn(e, "right", "up"))
+        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+
+        self.viewer_window.bind("<KeyPress>", self._on_key_press)
+        self.viewer_window.bind("<KeyRelease>", self._on_key_release)
+
+    def _toggle_fullscreen(self):
+        is_fs = self.viewer_window.attributes("-fullscreen")
+        self.viewer_window.attributes("-fullscreen", not is_fs)
+
+    def _close_viewer(self):
+        asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
+        if self.viewer_window:
+            self.viewer_window.destroy()
+            self.viewer_window = None
+
+    def _on_frame_received(self, jpeg_bytes: bytes, dims: tuple[int, int], cur: tuple[int, int]):
+        if not self.canvas:
+            return
+        try:
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            c_w = self.canvas.winfo_width()
+            c_h = self.canvas.winfo_height()
+            if c_w > 10 and c_h > 10:
+                # Resize keeping aspect ratio
+                img.thumbnail((c_w, c_h), Image.Resampling.BILINEAR)
+                self.current_img_dims = img.size
+                photo = ImageTk.PhotoImage(img)
+                self.photo_img = photo
+                self.canvas.delete("all")
+                # Center on canvas
+                pos_x = (c_w - img.width) // 2
+                pos_y = (c_h - img.height) // 2
+                self.canvas.create_image(pos_x, pos_y, anchor="nw", image=photo)
+        except Exception:
+            pass
+
+    def _calc_norm_coords(self, event) -> tuple[float, float]:
+        if not self.canvas or self.current_img_dims == (0, 0):
+            return (0.0, 0.0)
+        c_w = self.canvas.winfo_width()
+        c_h = self.canvas.winfo_height()
+        img_w, img_h = self.current_img_dims
+        offset_x = (c_w - img_w) / 2.0
+        offset_y = (c_h - img_h) / 2.0
+
+        rel_x = event.x - offset_x
+        rel_y = event.y - offset_y
+        norm_x = max(0.0, min(1.0, rel_x / img_w)) if img_w > 0 else 0.0
+        norm_y = max(0.0, min(1.0, rel_y / img_h)) if img_h > 0 else 0.0
+        return (norm_x, norm_y)
+
+    def _on_mouse_move(self, event):
+        nx, ny = self._calc_norm_coords(event)
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "mouse_move", "x": nx, "y": ny}),
+            self.loop
+        )
+
+    def _on_mouse_btn(self, event, button: str, action: str):
+        nx, ny = self._calc_norm_coords(event)
+        act_type = f"mouse_{action}"
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "mouse_move", "x": nx, "y": ny}),
+            self.loop
+        )
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": act_type, "button": button}),
+            self.loop
+        )
+
+    def _on_mouse_wheel(self, event):
+        delta = event.delta
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "mouse_wheel", "delta": delta}),
+            self.loop
+        )
+
+    def _on_key_press(self, event):
+        vk = event.keycode
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "key_down", "vk": vk}),
+            self.loop
+        )
+
+    def _on_key_release(self, event):
+        vk = event.keycode
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "key_up", "vk": vk}),
+            self.loop
+        )
+
+    def _send_special(self, cmd: str):
+        asyncio.run_coroutine_threadsafe(
+            self.client.send_input({"type": "special", "command": cmd}),
+            self.loop
+        )
+
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    gui = ClientViewerGUI()
+    gui.run()
