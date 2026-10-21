@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.superpowers/
+venv/
+dist/
+build/
+*.spec
+config.json
