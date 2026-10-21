@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import websockets
 from src.protocol import ProtocolMessage
 
@@ -13,20 +13,29 @@ class SignalingBroker:
         self.host = host
         self.port = port
         self.hosts: Dict[str, Any] = {} # clean_device_id -> websocket
+        self.host_salts: Dict[str, str] = {} # clean_device_id -> host_salt
+        self.routes: Dict[Any, Any] = {} # ws -> peer_ws
         self.server = None
 
-    def register_host(self, device_id: str, websocket: Any):
+    def register_host(self, device_id: str, websocket: Any, host_salt: str = ""):
         clean_id = device_id.replace(" ", "")
         self.hosts[clean_id] = websocket
+        self.host_salts[clean_id] = host_salt
 
     def unregister_host(self, device_id: str):
         clean_id = device_id.replace(" ", "")
         if clean_id in self.hosts:
             del self.hosts[clean_id]
+        if clean_id in self.host_salts:
+            del self.host_salts[clean_id]
 
     def get_host(self, device_id: str) -> Any:
         clean_id = device_id.replace(" ", "")
         return self.hosts.get(clean_id)
+
+    def get_host_salt(self, device_id: str) -> str:
+        clean_id = device_id.replace(" ", "")
+        return self.host_salts.get(clean_id, "")
 
     async def handle_connection(self, websocket):
         device_id = None
@@ -43,7 +52,8 @@ class SignalingBroker:
 
                 if msg_type == "REGISTER_HOST":
                     device_id = payload.get("device_id", "")
-                    self.register_host(device_id, websocket)
+                    host_salt = payload.get("host_salt", "")
+                    self.register_host(device_id, websocket, host_salt)
                     role = "host"
                     resp = ProtocolMessage.serialize("HOST_REGISTERED", {"status": "ok", "device_id": device_id})
                     await websocket.send(resp)
@@ -53,30 +63,48 @@ class SignalingBroker:
                     host_ws = self.get_host(target_id)
                     role = "client"
                     if host_ws:
-                        # Notify host of connection request with client's websocket ID / session
+                        host_salt = self.get_host_salt(target_id)
+                        # Pair client and host for bidirectional message relay
+                        self.routes[websocket] = host_ws
+                        self.routes[host_ws] = websocket
                         client_salt = payload.get("salt", "")
                         forward_msg = ProtocolMessage.serialize("CLIENT_ARRIVED", {
-                            "salt": client_salt
+                            "salt": client_salt,
+                            "client_id": target_id
                         })
                         await host_ws.send(forward_msg)
-                        resp = ProtocolMessage.serialize("HOST_FOUND", {"status": "ok", "device_id": target_id})
+                        resp = ProtocolMessage.serialize("HOST_FOUND", {
+                            "status": "ok",
+                            "device_id": target_id,
+                            "host_salt": host_salt
+                        })
                         await websocket.send(resp)
                     else:
                         resp = ProtocolMessage.serialize("HOST_NOT_FOUND", {"error": "Device is offline or ID not found"})
                         await websocket.send(resp)
 
-                elif msg_type in ("SIGNAL", "DATA", "AUTH_CHALLENGE", "AUTH_RESPONSE"):
-                    # Forward blindly to the peer
-                    target_id = payload.get("target_id", "").replace(" ", "")
-                    target_ws = self.get_host(target_id) if role == "client" else payload.get("client_ws")
+                else:
+                    # Forward all data and control packets directly to the paired peer
+                    target_ws = self.routes.get(websocket)
+                    if not target_ws:
+                        # Fallback: check target_id in payload
+                        target_id = payload.get("target_id", "").replace(" ", "")
+                        if target_id:
+                            target_ws = self.get_host(target_id)
                     if target_ws:
-                        await target_ws.send(raw)
+                        try:
+                            await target_ws.send(raw)
+                        except Exception as e:
+                            logger.warning(f"Failed to relay message to peer: {e}")
 
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
             if role == "host" and device_id:
                 self.unregister_host(device_id)
+            peer = self.routes.pop(websocket, None)
+            if peer and peer in self.routes:
+                del self.routes[peer]
 
     async def start(self):
         self.server = await websockets.serve(self.handle_connection, self.host, self.port)

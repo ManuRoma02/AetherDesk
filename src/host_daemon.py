@@ -36,6 +36,8 @@ class HostDaemon:
         self.running = False
         self.connected_clients: Dict[str, Any] = {}
         self._sleep_prevented = False
+        self.websocket = None
+        self._listener_task: Optional[asyncio.Task] = None
 
     def prevent_sleep(self, enable: bool = True) -> bool:
         """Prevent Windows from sleeping or turning off the screen while unattended."""
@@ -82,12 +84,9 @@ class HostDaemon:
         if msg_type == "AUTH_REQUEST":
             salt_hex = payload.get("salt", "")
             salt = bytes.fromhex(salt_hex) if salt_hex else b"salt"
-            # In E2EE mode, host computes the session key using its configured password
-            password = self.security.config.get("password_plain") # if set in session, or derived
-            # We derive session key from the host password hash salt
-            pwd_salt = self.security.config.get("pwd_salt", "")
-            if pwd_salt:
-                derived_key = self.security.derive_session_key(pwd_salt, salt)
+            master_hex = self.security.config.get("master_key", "")
+            if master_hex:
+                derived_key = self.security.derive_session_key(bytes.fromhex(master_hex), salt)
             else:
                 derived_key = self.security.derive_session_key("default_password", salt)
             session_state["session_key"] = derived_key
@@ -184,7 +183,14 @@ class HostDaemon:
             self.capture = DesktopCapture(quality=70)
 
         target_interval = 1.0 / 30.0 # 30 FPS
-        while self.running and websocket.open:
+        while self.running:
+            # Check connection state across modern websockets versions
+            ws_state = getattr(websocket, "state", None)
+            if ws_state is not None and getattr(ws_state, "name", "") != "OPEN":
+                break
+            if ws_state is None and not getattr(websocket, "open", True):
+                break
+
             start_t = time.time()
             try:
                 # Check clipboard change
@@ -209,15 +215,78 @@ class HostDaemon:
             sleep_t = max(0.001, target_interval - elapsed)
             await asyncio.sleep(sleep_t)
 
+    async def _broker_listener(self):
+        """Persistent connection to signaling broker with auto-reconnect."""
+        clean_id = self.device_id.replace(" ", "")
+        stream_task = None
+        while self.running:
+            try:
+                async with websockets.connect(self.broker_url) as ws:
+                    self.websocket = ws
+                    # Register this host with broker
+                    reg_msg = ProtocolMessage.serialize("REGISTER_HOST", {
+                        "device_id": clean_id,
+                        "host_salt": self.security.config.get("pwd_salt", "")
+                    })
+                    await ws.send(reg_msg)
+                    logger.info(f"Registered with signaling broker as {clean_id}")
+
+                    session_state = {}
+
+                    async for raw in ws:
+                        if isinstance(raw, str):
+                            raw = raw.encode("utf-8")
+                        try:
+                            msg_type, payload, binary = ProtocolMessage.deserialize(raw)
+                        except Exception as e:
+                            logger.warning(f"Failed to deserialize message: {e}")
+                            continue
+
+                        if msg_type == "CLIENT_ARRIVED":
+                            salt_hex = payload.get("salt", "")
+                            client_salt = bytes.fromhex(salt_hex) if salt_hex else b"salt"
+                            master_hex = self.security.config.get("master_key", "")
+                            if master_hex:
+                                master_key = bytes.fromhex(master_hex)
+                            else:
+                                master_key = self.security.derive_master_key("default_password", b"default_salt")
+
+                            session_key = self.security.derive_session_key(master_key, client_salt)
+                            session_state["session_key"] = session_key
+                            session_state["authenticated"] = True
+
+                            if stream_task and not stream_task.done():
+                                stream_task.cancel()
+                            stream_task = asyncio.create_task(self.run_capture_stream(ws, session_key))
+
+                        else:
+                            resp_bytes = self.handle_client_message(msg_type, payload, binary, session_state)
+                            if resp_bytes:
+                                await ws.send(resp_bytes)
+
+            except (websockets.exceptions.ConnectionClosed, OSError, Exception) as e:
+                logger.warning(f"Broker connection error: {e}. Retrying in 3s...")
+                if stream_task and not stream_task.done():
+                    stream_task.cancel()
+                if self.running:
+                    await asyncio.sleep(3.0)
+
     async def start(self):
         """Start daemon loop, prevent sleep, and connect to signaling broker."""
         self.running = True
         self.prevent_sleep(True)
         logger.info(f"Host Daemon started for Device ID: {self.device_id}")
+        self._listener_task = asyncio.create_task(self._broker_listener())
+        try:
+            await self._listener_task
+        except asyncio.CancelledError:
+            pass
 
     def stop(self):
         self.running = False
         self.prevent_sleep(False)
+        if self._listener_task and not self._listener_task.done():
+            self._listener_task.cancel()
         if self.capture:
             self.capture.close()
             self.capture = None

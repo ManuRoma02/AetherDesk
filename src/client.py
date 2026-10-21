@@ -96,6 +96,8 @@ class RemoteClient:
         self.websocket = None
         self.on_frame_callback: Optional[Callable[[bytes, tuple[int, int], tuple[int, int]], None]] = None
         self.on_status_callback: Optional[Callable[[str], None]] = None
+        self.on_clipboard_callback: Optional[Callable[[str], None]] = None
+        self.on_file_saved_callback: Optional[Callable[[str], None]] = None
         self.last_dev_id = ""
         self.last_password = ""
         self.auto_reconnect = True
@@ -113,6 +115,7 @@ class RemoteClient:
 
         self.last_dev_id = device_id
         self.last_password = password
+        self.auto_reconnect = True
         clean_id = ClientState.clean_id(device_id)
         self.state.set_connecting(True)
         self._set_status("Connessione al server di segnalazione...")
@@ -139,8 +142,11 @@ class RemoteClient:
 
             if msg_type == "HOST_FOUND":
                 self._set_status("Computer trovato. Autenticazione...")
-                # Derive session key with entered password
-                session_key = self.security.derive_session_key(password, salt)
+                # Derive session key with entered password and host salt
+                host_salt_hex = payload.get("host_salt", "")
+                host_salt = bytes.fromhex(host_salt_hex) if host_salt_hex else b""
+                master_key = self.security.derive_master_key(password, host_salt) if host_salt else password.encode("utf-8")
+                session_key = self.security.derive_session_key(master_key, salt)
                 self.state.set_connected(True, session_key)
                 self.state.target_id = clean_id
                 self._set_status("Connesso con successo!")
@@ -237,11 +243,11 @@ class RemoteClient:
         await self.websocket.send(msg)
 
     async def send_file(self, file_path: str, progress_callback=None):
-        """Stream a file chunk by chunk to the host."""
+        """Stream a file chunk by chunk to the host with minimal memory overhead."""
         if not self.state.is_connected or not self.websocket or not self.state.session_key:
             return False
 
-        meta, chunks = self.file_transfer.prepare_file_for_sending(file_path)
+        meta, _ = self.file_transfer.prepare_file_for_sending(file_path, chunk_size=1)
         meta["target_id"] = self.state.target_id
 
         # Send start
@@ -251,8 +257,8 @@ class RemoteClient:
         total_bytes = meta["filesize"]
         sent_bytes = 0
 
-        # Send chunks
-        for offset, chunk_data in chunks:
+        # Stream chunks one-by-one (O(1) memory usage)
+        for offset, chunk_data in self.file_transfer.iter_file_chunks(file_path):
             enc_chunk = self.security.encrypt_packet(chunk_data, self.state.session_key)
             chunk_msg = ProtocolMessage.serialize("FILE_CHUNK", {
                 "target_id": self.state.target_id,
@@ -263,7 +269,7 @@ class RemoteClient:
             sent_bytes += len(chunk_data)
             if progress_callback:
                 progress_callback(sent_bytes, total_bytes)
-            await asyncio.sleep(0.005) # Small yield
+            await asyncio.sleep(0.001)
 
         # Send end
         end_msg = ProtocolMessage.serialize("FILE_END", {
@@ -287,6 +293,7 @@ class RemoteClient:
             logger.error(f"Failed to send input: {e}")
 
     async def disconnect(self):
+        self.auto_reconnect = False
         self.state.set_connected(False)
         if self.websocket:
             await self.websocket.close()

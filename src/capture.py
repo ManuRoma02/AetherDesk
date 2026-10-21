@@ -223,6 +223,9 @@ class DesktopCapture:
         bmi.biBitCount = 32
         bmi.biCompression = 0
 
+        if not self._buffer:
+            return (b"", (screen_w, screen_h), (cur_x, cur_y))
+
         self.gdi32.GetDIBits(self._mem_dc, self._bitmap, 0, out_h, self._buffer, ctypes.byref(bmi), 0)
 
         # Encode to JPEG

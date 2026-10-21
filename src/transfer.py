@@ -52,13 +52,27 @@ class FileTransferManager:
 
     def __init__(self, save_dir: Optional[str] = None):
         if save_dir:
-            self.save_dir = Path(save_dir)
+            self.save_dir = Path(save_dir).resolve()
         else:
             downloads = Path(os.environ.get("USERPROFILE", "C:\\")) / "Downloads" / "RemoteDesktop_Transfers"
-            self.save_dir = downloads
+            self.save_dir = downloads.resolve()
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.incoming_transfers: Dict[str, Dict] = {} # file_id -> transfer state
+
+    def iter_file_chunks(self, file_path: str, chunk_size: int = 65536):
+        """Yield chunks one-by-one to avoid loading entire files into memory."""
+        p = Path(file_path)
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        with open(p, "rb") as f:
+            offset = 0
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                yield (offset, data)
+                offset += len(data)
 
     def prepare_file_for_sending(self, file_path: str, chunk_size: int = 65536) -> Tuple[dict, List[Tuple[int, bytes]]]:
         p = Path(file_path)
@@ -72,21 +86,20 @@ class FileTransferManager:
             "filename": p.name,
             "filesize": filesize
         }
-
-        chunks = []
-        with open(p, "rb") as f:
-            offset = 0
-            while True:
-                data = f.read(chunk_size)
-                if not data:
-                    break
-                chunks.append((offset, data))
-                offset += len(data)
-
+        chunks = list(self.iter_file_chunks(file_path, chunk_size))
         return (meta, chunks)
 
     def start_receiving(self, file_id: str, filename: str, filesize: int) -> Path:
-        target_path = self.save_dir / filename
+        # Sanitize filename against path traversal attacks (strip directory components)
+        clean_name = Path(filename).name
+        if not clean_name or clean_name in (".", ".."):
+            clean_name = f"transfer_{secrets.token_hex(4)}.dat"
+
+        target_path = (self.save_dir / clean_name).resolve()
+        # Verify target is strictly within save_dir
+        if not str(target_path).startswith(str(self.save_dir)):
+            target_path = self.save_dir / clean_name
+
         # Avoid overwriting existing files
         counter = 1
         base_name = target_path.stem
@@ -122,3 +135,12 @@ class FileTransferManager:
         saved_path = str(info["path"])
         del self.incoming_transfers[file_id]
         return saved_path
+
+    def cancel_transfer(self, file_id: str):
+        """Close handle and clean up aborted transfer."""
+        if file_id in self.incoming_transfers:
+            try:
+                self.incoming_transfers[file_id]["file_handle"].close()
+            except Exception:
+                pass
+            del self.incoming_transfers[file_id]
