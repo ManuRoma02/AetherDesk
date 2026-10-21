@@ -11,6 +11,7 @@ from src.capture import DesktopCapture
 from src.input_handler import InputHandler
 from src.security import SecurityManager
 from src.protocol import ProtocolMessage
+from src.transfer import ClipboardManager, FileTransferManager
 
 # Win32 Power Flags
 ES_CONTINUOUS = 0x80000000
@@ -27,6 +28,8 @@ class HostDaemon:
         self.broker_url = broker_url
         self.security = SecurityManager(config_dir=config_dir)
         self.input_handler = InputHandler()
+        self.clipboard = ClipboardManager()
+        self.file_transfer = FileTransferManager()
         self.capture: Optional[DesktopCapture] = None
         self.device_id = self.security.get_or_create_device_id()
 
@@ -92,6 +95,51 @@ class HostDaemon:
                 logger.error(f"Failed to decrypt/execute input: {e}")
                 return None
 
+        elif msg_type == "CLIPBOARD":
+            key = session_state.get("session_key")
+            if key and binary:
+                try:
+                    decrypted = self.security.decrypt_packet(binary, key)
+                    text = decrypted.decode("utf-8")
+                    self.clipboard.set_text(text, update_last=True)
+                    return ProtocolMessage.serialize("ACK", {"status": "clipboard_set"})
+                except Exception as e:
+                    logger.error(f"Clipboard sync error: {e}")
+
+        elif msg_type == "SWITCH_MONITOR":
+            mon_id = payload.get("monitor_id", 0)
+            if not self.capture:
+                self.capture = DesktopCapture(quality=70)
+            self.capture.set_monitor(mon_id)
+            return ProtocolMessage.serialize("ACK", {"status": "monitor_switched", "monitor_id": mon_id})
+
+        elif msg_type == "GET_MONITORS":
+            if not self.capture:
+                self.capture = DesktopCapture(quality=70)
+            mons = self.capture.get_monitors_list()
+            return ProtocolMessage.serialize("MONITORS_LIST", {"monitors": mons})
+
+        elif msg_type == "FILE_START":
+            file_id = payload.get("file_id")
+            filename = payload.get("filename")
+            filesize = payload.get("filesize", 0)
+            self.file_transfer.start_receiving(file_id, filename, filesize)
+            return ProtocolMessage.serialize("ACK", {"status": "file_started", "file_id": file_id})
+
+        elif msg_type == "FILE_CHUNK":
+            key = session_state.get("session_key")
+            file_id = payload.get("file_id")
+            offset = payload.get("offset", 0)
+            if key and binary:
+                chunk = self.security.decrypt_packet(binary, key)
+                self.file_transfer.receive_chunk(file_id, offset, chunk)
+                return ProtocolMessage.serialize("ACK", {"status": "chunk_received", "offset": offset})
+
+        elif msg_type == "FILE_END":
+            file_id = payload.get("file_id")
+            saved = self.file_transfer.finish_receiving(file_id)
+            return ProtocolMessage.serialize("FILE_SAVED", {"status": "ok", "saved_path": saved})
+
         return None
 
     def _execute_input(self, cmd: dict):
@@ -120,6 +168,14 @@ class HostDaemon:
         while self.running and websocket.open:
             start_t = time.time()
             try:
+                # Check clipboard change
+                if self.clipboard.has_changed():
+                    clip_text = self.clipboard.get_text()
+                    if clip_text:
+                        enc_clip = self.security.encrypt_packet(clip_text.encode("utf-8"), session_key)
+                        clip_msg = ProtocolMessage.serialize("CLIPBOARD", {}, binary_data=enc_clip)
+                        await websocket.send(clip_msg)
+
                 jpeg_bytes, size, cur = self.capture.capture_frame()
                 if jpeg_bytes:
                     encrypted = self.security.encrypt_packet(jpeg_bytes, session_key)

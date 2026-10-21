@@ -1,9 +1,10 @@
 import io
+import os
 import sys
 import asyncio
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
 from src.client import RemoteClient, ClientState
@@ -117,6 +118,27 @@ class ClientViewerGUI:
                            font=("Segoe UI", 9), command=self._toggle_fullscreen)
         btn_fs.pack(side=tk.LEFT, padx=5, pady=4)
 
+        # File Transfer button
+        btn_file = tk.Button(toolbar, text="Invia File", bg="#89b4fa", fg="#11111b", relief="flat",
+                             font=("Segoe UI", 9, "bold"), command=self._pick_and_send_file)
+        btn_file.pack(side=tk.LEFT, padx=5, pady=4)
+
+        # Monitor Selector
+        lbl_mon = tk.Label(toolbar, text="Monitor:", bg="#181825", fg="#a6adc8", font=("Segoe UI", 9))
+        lbl_mon.pack(side=tk.LEFT, padx=(10, 2), pady=4)
+
+        btn_m1 = tk.Button(toolbar, text="1", bg="#313244", fg="#cdd6f4", relief="flat", font=("Segoe UI", 8),
+                           command=lambda: self._switch_monitor(0))
+        btn_m1.pack(side=tk.LEFT, padx=2, pady=4)
+
+        btn_m2 = tk.Button(toolbar, text="2", bg="#313244", fg="#cdd6f4", relief="flat", font=("Segoe UI", 8),
+                           command=lambda: self._switch_monitor(1))
+        btn_m2.pack(side=tk.LEFT, padx=2, pady=4)
+
+        btn_mall = tk.Button(toolbar, text="Tutti", bg="#313244", fg="#cdd6f4", relief="flat", font=("Segoe UI", 8),
+                             command=lambda: self._switch_monitor(-1))
+        btn_mall.pack(side=tk.LEFT, padx=2, pady=4)
+
         btn_disc = tk.Button(toolbar, text="Disconnetti", bg="#f38ba8", fg="#11111b", relief="flat",
                              font=("Segoe UI", 9, "bold"), command=self._close_viewer)
         btn_disc.pack(side=tk.RIGHT, padx=5, pady=4)
@@ -136,9 +158,43 @@ class ClientViewerGUI:
         self.viewer_window.bind("<KeyPress>", self._on_key_press)
         self.viewer_window.bind("<KeyRelease>", self._on_key_release)
 
+        # Start clipboard sync loop
+        self._sync_clipboard_loop()
+
     def _toggle_fullscreen(self):
         is_fs = self.viewer_window.attributes("-fullscreen")
         self.viewer_window.attributes("-fullscreen", not is_fs)
+
+    def _switch_monitor(self, mon_id: int):
+        asyncio.run_coroutine_threadsafe(self.client.switch_monitor(mon_id), self.loop)
+
+    def _pick_and_send_file(self):
+        file_path = filedialog.askopenfilename(title="Seleziona file da inviare al PC fisso")
+        if not file_path:
+            return
+        threading.Thread(target=self._send_file_worker, args=(file_path,), daemon=True).start()
+
+    def _send_file_worker(self, file_path: str):
+        fn = os.path.basename(file_path)
+        self._on_status_update(f"Invio file '{fn}' in corso...")
+        future = asyncio.run_coroutine_threadsafe(self.client.send_file(file_path), self.loop)
+        try:
+            future.result()
+            self._on_status_update(f"File '{fn}' inviato con successo!")
+            self.root.after(0, lambda: messagebox.showinfo("File Inviato", f"Il file '{fn}' e' stato inviato al PC fisso nella cartella Download!"))
+        except Exception as e:
+            self._on_status_update(f"Errore invio file: {e}")
+
+    def _sync_clipboard_loop(self):
+        if self.viewer_window and self.client.state.is_connected:
+            try:
+                if self.client.clipboard.has_changed():
+                    txt = self.client.clipboard.get_text()
+                    if txt:
+                        asyncio.run_coroutine_threadsafe(self.client.send_clipboard(txt), self.loop)
+            except Exception:
+                pass
+        self.root.after(1500, self._sync_clipboard_loop)
 
     def _close_viewer(self):
         asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)

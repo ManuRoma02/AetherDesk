@@ -8,6 +8,7 @@ import websockets
 
 from src.security import SecurityManager
 from src.protocol import ProtocolMessage
+from src.transfer import ClipboardManager, FileTransferManager
 
 logger = logging.getLogger("RemoteClient")
 
@@ -45,9 +46,13 @@ class RemoteClient:
         self.broker_url = broker_url
         self.state = ClientState()
         self.security = SecurityManager()
+        self.clipboard = ClipboardManager()
+        self.file_transfer = FileTransferManager()
         self.websocket = None
         self.on_frame_callback: Optional[Callable[[bytes, tuple[int, int], tuple[int, int]], None]] = None
         self.on_status_callback: Optional[Callable[[str], None]] = None
+        self.on_clipboard_callback: Optional[Callable[[str], None]] = None
+        self.on_file_saved_callback: Optional[Callable[[str], None]] = None
 
     def _set_status(self, text: str):
         if self.on_status_callback:
@@ -121,10 +126,77 @@ class RemoteClient:
                     except Exception as e:
                         logger.error(f"Frame decrypt error: {e}")
 
+                elif msg_type == "CLIPBOARD" and binary and self.state.session_key:
+                    try:
+                        decrypted = self.security.decrypt_packet(binary, self.state.session_key)
+                        text = decrypted.decode("utf-8")
+                        self.clipboard.set_text(text, update_last=True)
+                        if self.on_clipboard_callback:
+                            self.on_clipboard_callback(text)
+                    except Exception as e:
+                        logger.error(f"Clipboard decrypt error: {e}")
+
+                elif msg_type == "FILE_SAVED":
+                    saved_path = payload.get("saved_path", "")
+                    if self.on_file_saved_callback:
+                        self.on_file_saved_callback(saved_path)
+
         except websockets.exceptions.ConnectionClosed:
             self._set_status("Connessione interrotta dal computer remoto.")
         finally:
             self.state.set_connected(False)
+
+    async def send_clipboard(self, text: str):
+        """Send local clipboard text to host."""
+        if not self.state.is_connected or not self.websocket or not self.state.session_key:
+            return
+        enc = self.security.encrypt_packet(text.encode("utf-8"), self.state.session_key)
+        msg = ProtocolMessage.serialize("CLIPBOARD", {"target_id": self.state.target_id}, binary_data=enc)
+        await self.websocket.send(msg)
+
+    async def switch_monitor(self, monitor_id: int):
+        """Request host to switch active screen."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("SWITCH_MONITOR", {"target_id": self.state.target_id, "monitor_id": monitor_id})
+        await self.websocket.send(msg)
+
+    async def send_file(self, file_path: str, progress_callback=None):
+        """Stream a file chunk by chunk to the host."""
+        if not self.state.is_connected or not self.websocket or not self.state.session_key:
+            return False
+
+        meta, chunks = self.file_transfer.prepare_file_for_sending(file_path)
+        meta["target_id"] = self.state.target_id
+
+        # Send start
+        start_msg = ProtocolMessage.serialize("FILE_START", meta)
+        await self.websocket.send(start_msg)
+
+        total_bytes = meta["filesize"]
+        sent_bytes = 0
+
+        # Send chunks
+        for offset, chunk_data in chunks:
+            enc_chunk = self.security.encrypt_packet(chunk_data, self.state.session_key)
+            chunk_msg = ProtocolMessage.serialize("FILE_CHUNK", {
+                "target_id": self.state.target_id,
+                "file_id": meta["file_id"],
+                "offset": offset
+            }, binary_data=enc_chunk)
+            await self.websocket.send(chunk_msg)
+            sent_bytes += len(chunk_data)
+            if progress_callback:
+                progress_callback(sent_bytes, total_bytes)
+            await asyncio.sleep(0.005) # Small yield
+
+        # Send end
+        end_msg = ProtocolMessage.serialize("FILE_END", {
+            "target_id": self.state.target_id,
+            "file_id": meta["file_id"]
+        })
+        await self.websocket.send(end_msg)
+        return True
 
     async def send_input(self, input_dict: dict):
         """Encrypt and send mouse/keyboard input to host."""
