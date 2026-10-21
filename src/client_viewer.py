@@ -14,14 +14,26 @@ class ClientViewerGUI:
 
     def __init__(self, broker_url: str = "ws://127.0.0.1:8765"):
         self.root = tk.Tk()
-        self.root.title("Remote Desktop Client")
-        self.root.geometry("450x320")
-        self.root.configure(bg="#1e1e2e")
+        self.root.title("AetherDesk - Client Portatile")
+        self.root.geometry("460x440")
+        self.root.configure(bg="#0a0c14")
 
-        self.client = RemoteClient(broker_url=broker_url)
+        # Set official window icon
+        icon_path = Path(__file__).parent.parent / "assets" / "icon.png"
+        if not icon_path.exists():
+            icon_path = Path(__file__).parent / "assets" / "icon.png"
+        if icon_path.exists():
+            try:
+                self.icon_photo = tk.PhotoImage(file=str(icon_path))
+                self.root.iconphoto(True, self.icon_photo)
+            except Exception:
+                pass
+
+        self.settings = ClientSettings()
+        initial_broker = self.settings.get_broker_url() if hasattr(self.settings, "get_broker_url") else broker_url
+        self.client = RemoteClient(broker_url=initial_broker)
         self.client.on_frame_callback = self._on_frame_received
         self.client.on_status_callback = self._on_status_update
-        self.settings = ClientSettings()
 
         self.loop = asyncio.new_event_loop()
         self.network_thread = threading.Thread(target=self._run_async_loop, daemon=True)
@@ -31,6 +43,7 @@ class ClientViewerGUI:
         self.canvas = None
         self.photo_img = None
         self.current_img_dims = (0, 0)
+        self._canvas_img_id = None
 
         self._build_login_ui()
 
@@ -41,45 +54,77 @@ class ClientViewerGUI:
     def _build_login_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("TLabel", background="#1e1e2e", foreground="#cdd6f4", font=("Segoe UI", 10))
-        style.configure("Header.TLabel", background="#1e1e2e", foreground="#89b4fa", font=("Segoe UI", 16, "bold"))
-        style.configure("Status.TLabel", background="#1e1e2e", foreground="#a6adc8", font=("Segoe UI", 9))
-        style.configure("TButton", font=("Segoe UI", 10, "bold"), background="#89b4fa", foreground="#11111b")
+        style.configure("TLabel", background="#0a0c14", foreground="#cdd6f4", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background="#0a0c14", foreground="#38bdf8", font=("Segoe UI", 18, "bold"))
+        style.configure("SubHeader.TLabel", background="#0a0c14", foreground="#94a3b8", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#0a0c14", foreground="#a6adc8", font=("Segoe UI", 9))
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), background="#38bdf8", foreground="#0a0c14")
 
-        container = tk.Frame(self.root, bg="#1e1e2e", padx=30, pady=20)
+        container = tk.Frame(self.root, bg="#0a0c14", padx=25, pady=12)
         container.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Label(container, text="Controllo Desktop Remoto", style="Header.TLabel")
-        header.pack(pady=(0, 15))
+        header = ttk.Label(container, text="AETHERDESK", style="Header.TLabel")
+        header.pack(pady=(0, 2))
+
+        subheader = ttk.Label(container, text="Controllo Remoto Ultra-Leggero (Zero-Bloat E2EE)", style="SubHeader.TLabel")
+        subheader.pack(pady=(0, 10))
 
         saved_id, saved_pwd, saved_rem = self.settings.load()
+        saved_broker = self.settings.get_broker_url()
+        devices = self.settings.get_devices()
 
+        # Device ID
         lbl_id = ttk.Label(container, text="ID Computer Remoto (9 cifre):")
         lbl_id.pack(anchor="w")
-        self.entry_id = tk.Entry(container, font=("Consolas", 14), justify="center", bg="#313244", fg="#cdd6f4", insertbackground="white")
-        self.entry_id.pack(fill=tk.X, pady=(2, 10), ipady=4)
-        self.entry_id.insert(0, saved_id if saved_id else "123 456 789")
 
+        device_options = [f"{d['id']} ({d.get('name', 'PC')})" for d in devices] if devices else []
+        self.combo_id = ttk.Combobox(container, values=device_options, font=("Consolas", 13), justify="center")
+        self.combo_id.pack(fill=tk.X, pady=(2, 8), ipady=3)
+        self.combo_id.set(saved_id if saved_id else "123 456 789")
+        self.combo_id.bind("<<ComboboxSelected>>", self._on_device_selected)
+
+        # Password
         lbl_pwd = ttk.Label(container, text="Password di Accesso:")
         lbl_pwd.pack(anchor="w")
-        self.entry_pwd = tk.Entry(container, font=("Segoe UI", 12), show="*", bg="#313244", fg="#cdd6f4", insertbackground="white")
+        self.entry_pwd = tk.Entry(container, font=("Segoe UI", 11), show="*", bg="#313244", fg="#cdd6f4", insertbackground="white")
         self.entry_pwd.pack(fill=tk.X, pady=(2, 8), ipady=3)
         if saved_pwd:
             self.entry_pwd.insert(0, saved_pwd)
 
+        # Broker URL (LAN / Cloud / VPN)
+        lbl_broker = ttk.Label(container, text="Server Broker (IP o Dominio):")
+        lbl_broker.pack(anchor="w")
+        self.entry_broker = tk.Entry(container, font=("Segoe UI", 10), bg="#313244", fg="#cdd6f4", insertbackground="white")
+        self.entry_broker.pack(fill=tk.X, pady=(2, 8), ipady=3)
+        self.entry_broker.insert(0, saved_broker if saved_broker else "ws://127.0.0.1:8765")
+
         self.var_remember = tk.BooleanVar(value=saved_rem)
-        self.chk_remember = tk.Checkbutton(container, text="Ricorda questo computer e password",
+        self.chk_remember = tk.Checkbutton(container, text="Ricorda questo computer e impostazioni",
                                            variable=self.var_remember, bg="#1e1e2e", fg="#cdd6f4",
                                            selectcolor="#313244", activebackground="#1e1e2e",
                                            activeforeground="#cdd6f4", font=("Segoe UI", 9))
-        self.chk_remember.pack(anchor="w", pady=(0, 12))
+        self.chk_remember.pack(anchor="w", pady=(0, 10))
 
         self.btn_connect = tk.Button(container, text="Connetti al Computer", bg="#89b4fa", fg="#11111b",
                                      font=("Segoe UI", 11, "bold"), relief="flat", cursor="hand2", command=self._start_connect)
         self.btn_connect.pack(fill=tk.X, ipady=6)
 
         self.lbl_status = ttk.Label(container, text="Pronto alla connessione.", style="Status.TLabel")
-        self.lbl_status.pack(pady=(12, 0))
+        self.lbl_status.pack(pady=(10, 0))
+
+    def _on_device_selected(self, event=None):
+        selected = self.combo_id.get().strip()
+        clean_id = selected.split(" ")[0] if " " in selected else selected
+        devices = self.settings.get_devices()
+        for d in devices:
+            if d.get("id", "").replace(" ", "") == clean_id.replace(" ", ""):
+                self.combo_id.set(d.get("id", ""))
+                self.entry_pwd.delete(0, tk.END)
+                self.entry_pwd.insert(0, d.get("password", ""))
+                if d.get("broker_url"):
+                    self.entry_broker.delete(0, tk.END)
+                    self.entry_broker.insert(0, d.get("broker_url"))
+                break
 
     def _on_status_update(self, text: str):
         self.root.after(0, lambda: self.lbl_status.config(text=text))
@@ -87,26 +132,30 @@ class ClientViewerGUI:
             self.root.after(0, lambda: self.viewer_window.title(f"Desktop Remoto - [{self.client.state.target_id}] - {text}"))
 
     def _start_connect(self):
-        dev_id = self.entry_id.get().strip()
+        dev_id = self.combo_id.get().strip().split(" ")[0]
         pwd = self.entry_pwd.get().strip()
+        broker_url = self.entry_broker.get().strip()
+        if not broker_url:
+            broker_url = "ws://127.0.0.1:8765"
 
         if not ClientState.validate_id(dev_id):
             messagebox.showerror("Errore ID", "L'ID deve essere composto esattamente da 9 cifre (es. 482 910 234).")
             return
 
         self.btn_connect.config(state="disabled", text="Connessione in corso...")
-        asyncio.run_coroutine_threadsafe(self._async_connect_task(dev_id, pwd), self.loop)
+        asyncio.run_coroutine_threadsafe(self._async_connect_task(dev_id, pwd, broker_url), self.loop)
 
-    async def _async_connect_task(self, dev_id: str, pwd: str):
-        ok = await self.client.connect(dev_id, pwd)
+    async def _async_connect_task(self, dev_id: str, pwd: str, broker_url: str):
+        ok = await self.client.connect(dev_id, pwd, broker_url=broker_url)
         self.root.after(0, lambda: self._handle_connect_result(ok))
 
     def _handle_connect_result(self, success: bool):
         self.btn_connect.config(state="normal", text="Connetti al Computer")
         if success:
-            dev_id = self.entry_id.get().strip()
+            dev_id = self.combo_id.get().strip().split(" ")[0]
             pwd = self.entry_pwd.get().strip()
-            self.settings.save(dev_id, pwd, self.var_remember.get())
+            broker_url = self.entry_broker.get().strip()
+            self.settings.save(dev_id, pwd, self.var_remember.get(), broker_url=broker_url)
             self._open_viewer_window()
 
     def _open_viewer_window(self):
@@ -114,7 +163,7 @@ class ClientViewerGUI:
             return
 
         self.viewer_window = tk.Toplevel(self.root)
-        self.viewer_window.title(f"Desktop Remoto - [{self.client.state.target_id}]")
+        self.viewer_window.title(f"AetherDesk - [{self.client.state.target_id}]")
         self.viewer_window.geometry("1280x720")
         self.viewer_window.configure(bg="#000000")
         self.viewer_window.protocol("WM_DELETE_WINDOW", self._close_viewer)
@@ -207,8 +256,18 @@ class ClientViewerGUI:
 
     def _send_file_worker(self, file_path: str):
         fn = os.path.basename(file_path)
-        self._on_status_update(f"Invio file '{fn}' in corso...")
-        future = asyncio.run_coroutine_threadsafe(self.client.send_file(file_path), self.loop)
+        self._on_status_update(f"Inizio invio file '{fn}'...")
+
+        def on_progress(sent, total):
+            pct = int((sent / total) * 100) if total > 0 else 100
+            mb_sent = sent / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            self._on_status_update(f"Invio '{fn}': {pct}% ({mb_sent:.1f}/{mb_total:.1f} MB)")
+
+        future = asyncio.run_coroutine_threadsafe(
+            self.client.send_file(file_path, progress_callback=on_progress),
+            self.loop
+        )
         try:
             future.result()
             self._on_status_update(f"File '{fn}' inviato con successo!")
@@ -229,6 +288,7 @@ class ClientViewerGUI:
 
     def _close_viewer(self):
         asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
+        self._canvas_img_id = None
         if self.viewer_window:
             self.viewer_window.destroy()
             self.viewer_window = None
@@ -246,11 +306,14 @@ class ClientViewerGUI:
                 self.current_img_dims = img.size
                 photo = ImageTk.PhotoImage(img)
                 self.photo_img = photo
-                self.canvas.delete("all")
-                # Center on canvas
+                # Center on canvas without delete('all') churn
                 pos_x = (c_w - img.width) // 2
                 pos_y = (c_h - img.height) // 2
-                self.canvas.create_image(pos_x, pos_y, anchor="nw", image=photo)
+                if self._canvas_img_id is None:
+                    self._canvas_img_id = self.canvas.create_image(pos_x, pos_y, anchor="nw", image=photo)
+                else:
+                    self.canvas.coords(self._canvas_img_id, pos_x, pos_y)
+                    self.canvas.itemconfig(self._canvas_img_id, image=photo)
         except Exception:
             pass
 

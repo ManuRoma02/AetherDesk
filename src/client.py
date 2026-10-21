@@ -15,7 +15,7 @@ from src.transfer import ClipboardManager, FileTransferManager
 logger = logging.getLogger("RemoteClient")
 
 class ClientSettings:
-    """Manages persistent client settings like saved device ID and password."""
+    """Manages persistent client settings like saved device ID, password, address book, and broker URL."""
 
     def __init__(self, config_dir: Optional[str] = None):
         if config_dir:
@@ -27,28 +27,91 @@ class ClientSettings:
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.config_dir / "client_settings.json"
 
-    def save(self, device_id: str, password: str, remember: bool = True):
-        data = {
-            "remember": remember,
-            "device_id": device_id if remember else "",
-            "password": password if remember else ""
-        }
+    def _read_data(self) -> dict:
+        if not self.config_file.exists():
+            return {}
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save(self, device_id: str, password: str, remember: bool = True, broker_url: str = "ws://127.0.0.1:8765"):
+        data = self._read_data()
+        data["remember"] = remember
+        data["device_id"] = device_id if remember else ""
+        data["password"] = password if remember else ""
+        data["broker_url"] = broker_url if broker_url else "ws://127.0.0.1:8765"
+
+        # Update or add to address book if remembered
+        if remember and device_id.strip():
+            devices = data.get("devices", [])
+            clean_id = re.sub(r"\s+", "", device_id.strip())
+            found = False
+            for d in devices:
+                if re.sub(r"\s+", "", d.get("id", "")) == clean_id:
+                    d["password"] = password
+                    d["broker_url"] = broker_url
+                    found = True
+                    break
+            if not found:
+                devices.append({
+                    "id": device_id.strip(),
+                    "name": f"Computer {device_id.strip()}",
+                    "password": password,
+                    "broker_url": broker_url
+                })
+            data["devices"] = devices
+
         with open(self.config_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def load(self) -> tuple[str, str, bool]:
-        if not self.config_file.exists():
-            return ("", "", False)
-        try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return (
-                    data.get("device_id", ""),
-                    data.get("password", ""),
-                    data.get("remember", False)
-                )
-        except Exception:
-            return ("", "", False)
+        data = self._read_data()
+        return (
+            data.get("device_id", ""),
+            data.get("password", ""),
+            data.get("remember", False)
+        )
+
+    def get_broker_url(self) -> str:
+        data = self._read_data()
+        return data.get("broker_url", "ws://127.0.0.1:8765")
+
+    def get_devices(self) -> list[dict]:
+        data = self._read_data()
+        return data.get("devices", [])
+
+    def save_device(self, device_id: str, name: str, password: str, broker_url: str):
+        data = self._read_data()
+        devices = data.get("devices", [])
+        clean_id = re.sub(r"\s+", "", device_id.strip())
+        found = False
+        for d in devices:
+            if re.sub(r"\s+", "", d.get("id", "")) == clean_id:
+                d["name"] = name
+                d["password"] = password
+                d["broker_url"] = broker_url
+                found = True
+                break
+        if not found:
+            devices.append({
+                "id": device_id.strip(),
+                "name": name if name else f"Computer {device_id.strip()}",
+                "password": password,
+                "broker_url": broker_url
+            })
+        data["devices"] = devices
+        with open(self.config_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def delete_device(self, device_id: str):
+        data = self._read_data()
+        clean_id = re.sub(r"\s+", "", device_id.strip())
+        devices = [d for d in data.get("devices", []) if re.sub(r"\s+", "", d.get("id", "")) != clean_id]
+        data["devices"] = devices
+        with open(self.config_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
 
 class ClientState:
     """Tracks state and validation for the client connection."""
@@ -107,8 +170,11 @@ class RemoteClient:
         if self.on_status_callback:
             self.on_status_callback(text)
 
-    async def connect(self, device_id: str, password: str) -> bool:
+    async def connect(self, device_id: str, password: str, broker_url: Optional[str] = None) -> bool:
         """Perform handshake and authenticate with remote host."""
+        if broker_url:
+            self.broker_url = broker_url.strip()
+
         if not ClientState.validate_id(device_id):
             self._set_status("ID non valido. Inserire 9 cifre.")
             return False
@@ -118,7 +184,7 @@ class RemoteClient:
         self.auto_reconnect = True
         clean_id = ClientState.clean_id(device_id)
         self.state.set_connecting(True)
-        self._set_status("Connessione al server di segnalazione...")
+        self._set_status(f"Connessione a {self.broker_url}...")
 
         try:
             self.websocket = await websockets.connect(self.broker_url)
@@ -136,7 +202,7 @@ class RemoteClient:
 
             if msg_type == "HOST_NOT_FOUND":
                 self.state.set_connecting(False)
-                self._set_status("Computer remoto non trovato o offline.")
+                self._set_status(f"Dispositivo {clean_id} non trovato o offline.")
                 await self.websocket.close()
                 return False
 
@@ -155,6 +221,12 @@ class RemoteClient:
                 asyncio.create_task(self._receive_loop())
                 return True
 
+        except (OSError, websockets.exceptions.WebSocketException) as e:
+            logger.error(f"Connection failed: {e}")
+            self.state.set_connecting(False)
+            self._set_status(f"Server non raggiungibile ({self.broker_url}). Verifica che il server sia attivo e la porta 8765 aperta.")
+            if self.websocket:
+                await self.websocket.close()
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             self.state.set_connecting(False)
@@ -247,7 +319,7 @@ class RemoteClient:
         if not self.state.is_connected or not self.websocket or not self.state.session_key:
             return False
 
-        meta, _ = self.file_transfer.prepare_file_for_sending(file_path, chunk_size=1)
+        meta = self.file_transfer.prepare_file_info(file_path)
         meta["target_id"] = self.state.target_id
 
         # Send start
@@ -258,7 +330,7 @@ class RemoteClient:
         sent_bytes = 0
 
         # Stream chunks one-by-one (O(1) memory usage)
-        for offset, chunk_data in self.file_transfer.iter_file_chunks(file_path):
+        for offset, chunk_data in self.file_transfer.iter_file_chunks(file_path, chunk_size=65536):
             enc_chunk = self.security.encrypt_packet(chunk_data, self.state.session_key)
             chunk_msg = ProtocolMessage.serialize("FILE_CHUNK", {
                 "target_id": self.state.target_id,

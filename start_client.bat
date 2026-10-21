@@ -1,9 +1,9 @@
 @echo off
 setlocal
-title Remote Desktop - Portatile (Client)
+title AetherDesk - Client Portatile
 cd /d "%~dp0"
 
-echo Avvio dell'Applicazione Client...
+echo Avvio di AetherDesk Client...
 if exist "venv\Scripts\python.exe" (
     start "" "venv\Scripts\pythonw.exe" "src\client_viewer.py"
 ) else (

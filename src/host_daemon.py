@@ -162,11 +162,21 @@ class HostDaemon:
 
     def _execute_input(self, cmd: dict):
         action = cmd.get("type", "")
+        mon_bounds = self.capture.get_active_monitor_bounds() if self.capture else None
+        virt_bounds = self.capture.get_virtual_desktop_bounds() if self.capture else None
+
         if action == "mouse_move":
-            self.input_handler.move_mouse(cmd.get("x", 0.0), cmd.get("y", 0.0))
+            self.input_handler.move_mouse(cmd.get("x", 0.0), cmd.get("y", 0.0),
+                                          monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
         elif action == "mouse_down":
+            if "x" in cmd and "y" in cmd:
+                self.input_handler.move_mouse(cmd.get("x", 0.0), cmd.get("y", 0.0),
+                                              monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
             self.input_handler.mouse_down(cmd.get("button", "left"))
         elif action == "mouse_up":
+            if "x" in cmd and "y" in cmd:
+                self.input_handler.move_mouse(cmd.get("x", 0.0), cmd.get("y", 0.0),
+                                              monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
             self.input_handler.mouse_up(cmd.get("button", "left"))
         elif action == "mouse_wheel":
             self.input_handler.mouse_wheel(cmd.get("delta", 0))
@@ -178,11 +188,12 @@ class HostDaemon:
             self.input_handler.send_special(cmd.get("command", ""))
 
     async def run_capture_stream(self, websocket, session_key: bytes):
-        """Streaming loop: captures screen and sends encrypted JPEG frames."""
+        """Streaming loop: captures screen and sends encrypted JPEG frames with change detection."""
         if not self.capture:
             self.capture = DesktopCapture(quality=70)
 
         target_interval = 1.0 / 30.0 # 30 FPS
+        frame_counter = 0
         while self.running:
             # Check connection state across modern websockets versions
             ws_state = getattr(websocket, "state", None)
@@ -201,7 +212,9 @@ class HostDaemon:
                         clip_msg = ProtocolMessage.serialize("CLIPBOARD", {}, binary_data=enc_clip)
                         await websocket.send(clip_msg)
 
-                jpeg_bytes, size, cur = self.capture.capture_frame()
+                frame_counter += 1
+                force_keyframe = (frame_counter % 30 == 0)
+                jpeg_bytes, size, cur = self.capture.capture_frame(only_if_changed=(not force_keyframe))
                 if jpeg_bytes:
                     encrypted = self.security.encrypt_packet(jpeg_bytes, session_key)
                     meta = {"w": size[0], "h": size[1], "cx": cur[0], "cy": cur[1]}

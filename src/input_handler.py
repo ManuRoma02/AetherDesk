@@ -80,8 +80,14 @@ class InputHandler:
         h = self.user32.GetSystemMetrics(1)
         return (w if w > 0 else 1920, h if h > 0 else 1080)
 
-    def normalize_to_screen(self, norm_x: float, norm_y: float) -> tuple[int, int]:
+    def normalize_to_screen(self, norm_x: float, norm_y: float,
+                            monitor_bounds: tuple[int, int, int, int] = None) -> tuple[int, int]:
         """Convert normalized (0.0 to 1.0) coordinates to screen pixels."""
+        if monitor_bounds:
+            src_x, src_y, src_w, src_h = monitor_bounds
+            x = int(src_x + norm_x * src_w)
+            y = int(src_y + norm_y * src_h)
+            return (x, y)
         w, h = self.get_screen_bounds()
         x = int(norm_x * w)
         y = int(norm_y * h)
@@ -90,10 +96,26 @@ class InputHandler:
     def _send_input(self, inp: INPUT):
         self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
-    def move_mouse(self, norm_x: float, norm_y: float):
-        """Move cursor using absolute coordinate space (0..65535)."""
-        abs_x = int(max(0.0, min(1.0, norm_x)) * 65535)
-        abs_y = int(max(0.0, min(1.0, norm_y)) * 65535)
+    def move_mouse(self, norm_x: float, norm_y: float,
+                   monitor_bounds: tuple[int, int, int, int] = None,
+                   virtual_bounds: tuple[int, int, int, int] = None):
+        """Move cursor using absolute coordinate space (0..65535), properly mapped to the active monitor."""
+        if monitor_bounds and virtual_bounds:
+            src_x, src_y, src_w, src_h = monitor_bounds
+            vx, vy, vw, vh = virtual_bounds
+            if vw > 0 and vh > 0:
+                pixel_x = src_x + norm_x * src_w
+                pixel_y = src_y + norm_y * src_h
+                norm_vx = (pixel_x - vx) / vw
+                norm_vy = (pixel_y - vy) / vh
+                abs_x = int(max(0.0, min(1.0, norm_vx)) * 65535)
+                abs_y = int(max(0.0, min(1.0, norm_vy)) * 65535)
+            else:
+                abs_x = int(max(0.0, min(1.0, norm_x)) * 65535)
+                abs_y = int(max(0.0, min(1.0, norm_y)) * 65535)
+        else:
+            abs_x = int(max(0.0, min(1.0, norm_x)) * 65535)
+            abs_y = int(max(0.0, min(1.0, norm_y)) * 65535)
 
         inp = INPUT()
         inp.type = INPUT_MOUSE

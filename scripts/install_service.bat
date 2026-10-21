@@ -14,35 +14,38 @@ if %errorLevel% neq 0 (
 
 cd /d "%~dp0\.."
 
-set "PYTHON_EXE=python.exe"
 set "SERVICE_NAME=RemoteDesktopHost"
 set "DISPLAY_NAME=Remote Desktop Unattended Host Service"
-set "BIN_PATH=\"%~dp0..\venv\Scripts\python.exe\" \"%~dp0..\src\host_service.py\""
+set "BIN_PATH=%~dp0..\venv\Scripts\python.exe"
 
-:: Se non siamo in un venv, usa il python di sistema
-if not exist "%~dp0..\venv\Scripts\python.exe" (
-    for /f "tokens=*" %%i in ('where python') do set "SYS_PYTHON=%%i" & goto :found_python
+if not exist "%BIN_PATH%" (
+    for /f "tokens=*" %%i in ('where python') do set "BIN_PATH=%%i" & goto :found_python
 )
 :found_python
-if defined SYS_PYTHON (
-    set "BIN_PATH=\"%SYS_PYTHON%\" \"%~dp0..\src\host_service.py\""
-)
+
+set "SCRIPT_PATH=%~dp0..\src\host_service.py"
 
 echo Rimozione eventuale istanza precedente...
+schtasks /delete /tn "%SERVICE_NAME%" /f >nul 2>&1
 sc.exe stop %SERVICE_NAME% >nul 2>&1
 sc.exe delete %SERVICE_NAME% >nul 2>&1
 timeout /t 1 >nul
 
-echo Creazione servizio di sistema con avvio automatico all'accensione...
-sc.exe create %SERVICE_NAME% binPath= "%BIN_PATH%" start= auto DisplayName= "%DISPLAY_NAME%"
-sc.exe description %SERVICE_NAME% "Consente il controllo remoto sicuro del computer anche da fuori casa, attivo all'avvio prima del login."
-sc.exe failure %SERVICE_NAME% reset= 86400 actions= restart/5000/restart/10000/restart/30000
+echo Creazione attivita' di sistema ad avvio automatico all'accensione (SYSTEM)...
+schtasks /create /tn "%SERVICE_NAME%" /tr "\"%BIN_PATH%\" \"%SCRIPT_PATH%\"" /sc onstart /ru SYSTEM /rl highest /f >nul 2>&1
 
-echo Avvio del servizio...
-sc.exe start %SERVICE_NAME%
+if %errorLevel% equ 0 (
+    echo [OK] Attivita' pianificata creata con successo (Accesso non presidiato attivo prima del login).
+    echo Avvio immediato...
+    schtasks /run /tn "%SERVICE_NAME%" >nul 2>&1
+) else (
+    echo Configurazione fallback tramite Windows Service Manager (SCM)...
+    sc.exe create %SERVICE_NAME% binPath= "\"%BIN_PATH%\" \"%SCRIPT_PATH%\"" start= auto DisplayName= "%DISPLAY_NAME%" >nul 2>&1
+    sc.exe start %SERVICE_NAME% >nul 2>&1
+)
 
 echo.
-echo [OK] Servizio installato e avviato con successo!
-echo Il servizio si avviera' automaticamente ad ogni accensione del PC.
+echo [OK] Servizio non presidiato installato e avviato!
+echo Il servizio rimarra' attivo ad ogni avvio o accensione del computer.
 echo.
 pause

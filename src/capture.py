@@ -72,6 +72,8 @@ class DesktopCapture:
         self._bitmap = None
         self._last_dims = (0, 0, 0, 0)
         self._buffer = None
+        self._last_thumb = None
+        self._last_cursor = (0, 0)
 
     def switch_desktop(self) -> bool:
         """Switch current thread desktop to the active input desktop (handles UAC/lockscreen)."""
@@ -134,6 +136,18 @@ class DesktopCapture:
     def set_monitor(self, monitor_id: int):
         self.current_monitor_id = monitor_id
         self._last_dims = (0, 0, 0, 0)
+        self._last_thumb = None
+
+    def get_virtual_desktop_bounds(self) -> tuple[int, int, int, int]:
+        """Returns (vx, vy, vw, vh) for virtual desktop spanning all monitors."""
+        vx = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if vw <= 0 or vh <= 0:
+            w, h = self.get_screen_resolution()
+            return (0, 0, w, h)
+        return (vx, vy, vw, vh)
 
     def get_active_monitor_bounds(self) -> tuple[int, int, int, int]:
         """Returns (src_x, src_y, src_w, src_h) for currently active monitor."""
@@ -158,7 +172,7 @@ class DesktopCapture:
             return (pt.x, pt.y)
         return (0, 0)
 
-    def capture_frame(self) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
+    def capture_frame(self, only_if_changed: bool = False) -> tuple[bytes | None, tuple[int, int], tuple[int, int]]:
         """Capture the current frame, encode as JPEG, and return (jpeg_bytes, (screen_w, screen_h), (cur_x, cur_y))."""
         src_x, src_y, screen_w, screen_h = self.get_active_monitor_bounds()
         cur_x, cur_y = self.get_cursor_position()
@@ -232,6 +246,18 @@ class DesktopCapture:
         arr = np.frombuffer(self._buffer, dtype=np.uint8).reshape((out_h, out_w, 4))
         # Keep BGR channels
         bgr = arr[:, :, :3]
+
+        cur_pos = (cur_x, cur_y)
+        # Fast change detection via downsampled thumbnail
+        thumb = cv2.resize(bgr, (32, 18), interpolation=cv2.INTER_NEAREST)
+        if only_if_changed and self._last_thumb is not None:
+            if cur_pos == self._last_cursor and np.array_equal(thumb, self._last_thumb):
+                # No change in screen or cursor
+                return (None, (screen_w, screen_h), cur_pos)
+
+        self._last_thumb = thumb
+        self._last_cursor = cur_pos
+
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
         success, enc = cv2.imencode('.jpg', bgr, encode_params)
 

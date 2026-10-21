@@ -14,13 +14,13 @@ if %errorLevel% neq 0 (
 
 set "SERVICE_NAME=RemoteDesktopHost"
 
-echo Arresto del servizio...
-sc.exe stop %SERVICE_NAME%
-
-echo Rimozione del servizio...
-sc.exe delete %SERVICE_NAME%
+echo Arresto e rimozione servizio / attivita' pianificata...
+schtasks /end /tn "%SERVICE_NAME%" >nul 2>&1
+schtasks /delete /tn "%SERVICE_NAME%" /f >nul 2>&1
+sc.exe stop %SERVICE_NAME% >nul 2>&1
+sc.exe delete %SERVICE_NAME% >nul 2>&1
 
 echo.
-echo [OK] Servizio rimosso con successo.
+echo [OK] Servizio e avvio automatico rimossi con successo.
 echo.
 pause

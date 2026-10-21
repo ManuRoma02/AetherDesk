@@ -10,35 +10,64 @@ class ClipboardManager:
 
     def __init__(self):
         self.last_text = ""
+        self._fallback_text = ""
 
     def get_text(self) -> str:
         text = ""
-        for _ in range(5):
+        opened = False
+        for _ in range(10):
             try:
                 win32clipboard.OpenClipboard()
-                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
-                    text = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
-                win32clipboard.CloseClipboard()
+                opened = True
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT):
+                        text = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+                finally:
+                    win32clipboard.CloseClipboard()
+                    opened = False
                 break
             except Exception:
-                time.sleep(0.01)
-        return text if text else ""
+                if opened:
+                    try:
+                        win32clipboard.CloseClipboard()
+                    except Exception:
+                        pass
+                    opened = False
+                time.sleep(0.02)
+        if text:
+            self._fallback_text = text
+            return text
+        return self._fallback_text
 
     def set_text(self, text: str, update_last: bool = True) -> bool:
         if not text:
             return False
-        for _ in range(5):
+        self._fallback_text = text
+        opened = False
+        success = False
+        for _ in range(10):
             try:
                 win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-                win32clipboard.CloseClipboard()
-                if update_last:
-                    self.last_text = text
-                return True
+                opened = True
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+                    success = True
+                finally:
+                    win32clipboard.CloseClipboard()
+                    opened = False
+                break
             except Exception:
-                time.sleep(0.01)
-        return False
+                if opened:
+                    try:
+                        win32clipboard.CloseClipboard()
+                    except Exception:
+                        pass
+                    opened = False
+                time.sleep(0.02)
+        if update_last:
+            self.last_text = text
+        return True
 
     def has_changed(self) -> bool:
         current = self.get_text()
@@ -73,6 +102,17 @@ class FileTransferManager:
                     break
                 yield (offset, data)
                 offset += len(data)
+
+    def prepare_file_info(self, file_path: str) -> dict:
+        """Extract metadata for streaming transfer without memory buffering."""
+        p = Path(file_path)
+        if not p.exists() or not p.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        return {
+            "file_id": secrets.token_hex(8),
+            "filename": p.name,
+            "filesize": p.stat().st_size
+        }
 
     def prepare_file_for_sending(self, file_path: str, chunk_size: int = 65536) -> Tuple[dict, List[Tuple[int, bytes]]]:
         p = Path(file_path)
