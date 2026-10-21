@@ -55,6 +55,20 @@ class HostDaemon:
             logger.warning(f"Failed to set sleep state: {e}")
             return False
 
+    def set_privacy_mode(self, enable: bool) -> bool:
+        """Turn physical monitor off (privacy mode) or on."""
+        try:
+            user32 = ctypes.windll.user32
+            # WM_SYSCOMMAND = 0x0112, SC_MONITORPOWER = 0xF170
+            # lParam: 2 = power off, -1 = power on
+            val = 2 if enable else -1
+            # Use SendNotifyMessageW or PostMessageW to avoid blocking on unresponsive top-level windows
+            user32.SendNotifyMessageW(0xFFFF, 0x0112, 0xF170, val)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to toggle monitor power: {e}")
+            return False
+
     def get_status(self) -> dict:
         return {
             "device_id": self.device_id,
@@ -118,6 +132,11 @@ class HostDaemon:
                 self.capture = DesktopCapture(quality=70)
             mons = self.capture.get_monitors_list()
             return ProtocolMessage.serialize("MONITORS_LIST", {"monitors": mons})
+
+        elif msg_type == "PRIVACY_MODE":
+            enabled = payload.get("enabled", False)
+            res = self.set_privacy_mode(enabled)
+            return ProtocolMessage.serialize("ACK", {"status": "privacy_mode", "enabled": enabled, "result": res})
 
         elif msg_type == "FILE_START":
             file_id = payload.get("file_id")

@@ -6,11 +6,49 @@ import logging
 from typing import Optional, Callable
 import websockets
 
+import os
+from pathlib import Path
 from src.security import SecurityManager
 from src.protocol import ProtocolMessage
 from src.transfer import ClipboardManager, FileTransferManager
 
 logger = logging.getLogger("RemoteClient")
+
+class ClientSettings:
+    """Manages persistent client settings like saved device ID and password."""
+
+    def __init__(self, config_dir: Optional[str] = None):
+        if config_dir:
+            self.config_dir = Path(config_dir)
+        else:
+            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+            self.config_dir = Path(appdata) / "RemoteDesktopClient"
+
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file = self.config_dir / "client_settings.json"
+
+    def save(self, device_id: str, password: str, remember: bool = True):
+        data = {
+            "remember": remember,
+            "device_id": device_id if remember else "",
+            "password": password if remember else ""
+        }
+        with open(self.config_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def load(self) -> tuple[str, str, bool]:
+        if not self.config_file.exists():
+            return ("", "", False)
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return (
+                    data.get("device_id", ""),
+                    data.get("password", ""),
+                    data.get("remember", False)
+                )
+        except Exception:
+            return ("", "", False)
 
 class ClientState:
     """Tracks state and validation for the client connection."""
@@ -18,6 +56,7 @@ class ClientState:
     def __init__(self):
         self.is_connected = False
         self.is_connecting = False
+        self.is_reconnecting = False
         self.session_key: Optional[bytes] = None
         self.target_id: Optional[str] = None
         self.host_dims = (1920, 1080)
@@ -34,9 +73,15 @@ class ClientState:
     def set_connecting(self, connecting: bool):
         self.is_connecting = connecting
 
+    def set_reconnecting(self, reconnecting: bool):
+        self.is_reconnecting = reconnecting
+        if reconnecting:
+            self.is_connected = False
+
     def set_connected(self, connected: bool, session_key: Optional[bytes] = None):
         self.is_connected = connected
         self.is_connecting = False
+        self.is_reconnecting = False
         self.session_key = session_key
 
 class RemoteClient:
@@ -51,8 +96,10 @@ class RemoteClient:
         self.websocket = None
         self.on_frame_callback: Optional[Callable[[bytes, tuple[int, int], tuple[int, int]], None]] = None
         self.on_status_callback: Optional[Callable[[str], None]] = None
-        self.on_clipboard_callback: Optional[Callable[[str], None]] = None
-        self.on_file_saved_callback: Optional[Callable[[str], None]] = None
+        self.last_dev_id = ""
+        self.last_password = ""
+        self.auto_reconnect = True
+        self.max_reconnect_attempts = 10
 
     def _set_status(self, text: str):
         if self.on_status_callback:
@@ -64,6 +111,8 @@ class RemoteClient:
             self._set_status("ID non valido. Inserire 9 cifre.")
             return False
 
+        self.last_dev_id = device_id
+        self.last_password = password
         clean_id = ClientState.clean_id(device_id)
         self.state.set_connecting(True)
         self._set_status("Connessione al server di segnalazione...")
@@ -141,10 +190,36 @@ class RemoteClient:
                     if self.on_file_saved_callback:
                         self.on_file_saved_callback(saved_path)
 
-        except websockets.exceptions.ConnectionClosed:
-            self._set_status("Connessione interrotta dal computer remoto.")
-        finally:
-            self.state.set_connected(False)
+        except (websockets.exceptions.ConnectionClosed, Exception) as e:
+            logger.warning(f"Connection lost: {e}")
+            if self.auto_reconnect and self.last_dev_id and not self.state.is_reconnecting:
+                asyncio.create_task(self._attempt_reconnection())
+            else:
+                self.state.set_connected(False)
+                self._set_status("Connessione interrotta dal computer remoto.")
+
+    async def _attempt_reconnection(self):
+        self.state.set_reconnecting(True)
+        for attempt in range(1, self.max_reconnect_attempts + 1):
+            self._set_status(f"Connessione persa. Riconnessione in corso... ({attempt}/{self.max_reconnect_attempts})")
+            await asyncio.sleep(2.0)
+            try:
+                ok = await self.connect(self.last_dev_id, self.last_password)
+                if ok:
+                    self._set_status("Riconnesso con successo!")
+                    return
+            except Exception:
+                pass
+        self.state.set_reconnecting(False)
+        self.state.set_connected(False)
+        self._set_status("Impossibile riconnettersi al computer remoto.")
+
+    async def toggle_privacy_mode(self, enabled: bool):
+        """Turn on/off physical monitor on host PC."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("PRIVACY_MODE", {"target_id": self.state.target_id, "enabled": enabled})
+        await self.websocket.send(msg)
 
     async def send_clipboard(self, text: str):
         """Send local clipboard text to host."""

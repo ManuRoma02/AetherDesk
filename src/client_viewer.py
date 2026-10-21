@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
-from src.client import RemoteClient, ClientState
+from src.client import RemoteClient, ClientState, ClientSettings
 
 class ClientViewerGUI:
     """Portable GUI Application for connecting to remote desktop host."""
@@ -21,6 +21,7 @@ class ClientViewerGUI:
         self.client = RemoteClient(broker_url=broker_url)
         self.client.on_frame_callback = self._on_frame_received
         self.client.on_status_callback = self._on_status_update
+        self.settings = ClientSettings()
 
         self.loop = asyncio.new_event_loop()
         self.network_thread = threading.Thread(target=self._run_async_loop, daemon=True)
@@ -51,16 +52,27 @@ class ClientViewerGUI:
         header = ttk.Label(container, text="Controllo Desktop Remoto", style="Header.TLabel")
         header.pack(pady=(0, 15))
 
+        saved_id, saved_pwd, saved_rem = self.settings.load()
+
         lbl_id = ttk.Label(container, text="ID Computer Remoto (9 cifre):")
         lbl_id.pack(anchor="w")
         self.entry_id = tk.Entry(container, font=("Consolas", 14), justify="center", bg="#313244", fg="#cdd6f4", insertbackground="white")
         self.entry_id.pack(fill=tk.X, pady=(2, 10), ipady=4)
-        self.entry_id.insert(0, "123 456 789")
+        self.entry_id.insert(0, saved_id if saved_id else "123 456 789")
 
         lbl_pwd = ttk.Label(container, text="Password di Accesso:")
         lbl_pwd.pack(anchor="w")
         self.entry_pwd = tk.Entry(container, font=("Segoe UI", 12), show="*", bg="#313244", fg="#cdd6f4", insertbackground="white")
-        self.entry_pwd.pack(fill=tk.X, pady=(2, 15), ipady=3)
+        self.entry_pwd.pack(fill=tk.X, pady=(2, 8), ipady=3)
+        if saved_pwd:
+            self.entry_pwd.insert(0, saved_pwd)
+
+        self.var_remember = tk.BooleanVar(value=saved_rem)
+        self.chk_remember = tk.Checkbutton(container, text="Ricorda questo computer e password",
+                                           variable=self.var_remember, bg="#1e1e2e", fg="#cdd6f4",
+                                           selectcolor="#313244", activebackground="#1e1e2e",
+                                           activeforeground="#cdd6f4", font=("Segoe UI", 9))
+        self.chk_remember.pack(anchor="w", pady=(0, 12))
 
         self.btn_connect = tk.Button(container, text="Connetti al Computer", bg="#89b4fa", fg="#11111b",
                                      font=("Segoe UI", 11, "bold"), relief="flat", cursor="hand2", command=self._start_connect)
@@ -71,6 +83,8 @@ class ClientViewerGUI:
 
     def _on_status_update(self, text: str):
         self.root.after(0, lambda: self.lbl_status.config(text=text))
+        if self.viewer_window and tk.Toplevel.winfo_exists(self.viewer_window):
+            self.root.after(0, lambda: self.viewer_window.title(f"Desktop Remoto - [{self.client.state.target_id}] - {text}"))
 
     def _start_connect(self):
         dev_id = self.entry_id.get().strip()
@@ -90,6 +104,9 @@ class ClientViewerGUI:
     def _handle_connect_result(self, success: bool):
         self.btn_connect.config(state="normal", text="Connetti al Computer")
         if success:
+            dev_id = self.entry_id.get().strip()
+            pwd = self.entry_pwd.get().strip()
+            self.settings.save(dev_id, pwd, self.var_remember.get())
             self._open_viewer_window()
 
     def _open_viewer_window(self):
@@ -139,6 +156,12 @@ class ClientViewerGUI:
                              command=lambda: self._switch_monitor(-1))
         btn_mall.pack(side=tk.LEFT, padx=2, pady=4)
 
+        # Privacy Mode (Schermo Nero Host)
+        self.privacy_on = False
+        self.btn_privacy = tk.Button(toolbar, text="Privacy: Schermo Nero (OFF)", bg="#313244", fg="#cdd6f4",
+                                     relief="flat", font=("Segoe UI", 9), command=self._toggle_privacy)
+        self.btn_privacy.pack(side=tk.LEFT, padx=5, pady=4)
+
         btn_disc = tk.Button(toolbar, text="Disconnetti", bg="#f38ba8", fg="#11111b", relief="flat",
                              font=("Segoe UI", 9, "bold"), command=self._close_viewer)
         btn_disc.pack(side=tk.RIGHT, padx=5, pady=4)
@@ -164,6 +187,14 @@ class ClientViewerGUI:
     def _toggle_fullscreen(self):
         is_fs = self.viewer_window.attributes("-fullscreen")
         self.viewer_window.attributes("-fullscreen", not is_fs)
+
+    def _toggle_privacy(self):
+        self.privacy_on = not self.privacy_on
+        txt = "Privacy: Schermo Nero (ON)" if self.privacy_on else "Privacy: Schermo Nero (OFF)"
+        bg = "#a6e3a1" if self.privacy_on else "#313244"
+        fg = "#11111b" if self.privacy_on else "#cdd6f4"
+        self.btn_privacy.config(text=txt, bg=bg, fg=fg)
+        asyncio.run_coroutine_threadsafe(self.client.toggle_privacy_mode(self.privacy_on), self.loop)
 
     def _switch_monitor(self, mon_id: int):
         asyncio.run_coroutine_threadsafe(self.client.switch_monitor(mon_id), self.loop)
