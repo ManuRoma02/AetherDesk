@@ -20,3 +20,18 @@ def test_desktop_switch_desktop():
     res = cap.switch_desktop()
     assert isinstance(res, bool)
     cap.close()
+
+def test_desktop_multimonitor():
+    cap = DesktopCapture()
+    monitors = cap.get_monitors_list()
+    assert isinstance(monitors, list)
+    assert len(monitors) >= 1
+    assert "id" in monitors[0]
+    assert "rect" in monitors[0]
+    # Set primary monitor
+    cap.set_monitor(0)
+    assert cap.current_monitor_id == 0
+    # Set all monitors
+    cap.set_monitor(-1)
+    assert cap.current_monitor_id == -1
+    cap.close()

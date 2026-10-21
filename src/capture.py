@@ -2,6 +2,7 @@ import ctypes
 from ctypes import wintypes
 import cv2
 import numpy as np
+import win32api
 
 # Win32 Constants
 DESKTOP_READOBJECTS = 0x0001
@@ -10,6 +11,11 @@ DESKTOP_SWITCHDESKTOP = 0x0100
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 SRCCOPY = 0x00CC0020
 COLORONCOLOR = 3
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
@@ -58,6 +64,7 @@ class DesktopCapture:
                 pass
 
         self.current_desktop = None
+        self.current_monitor_id = 0
         self.switch_desktop()
 
         self._src_dc = None
@@ -84,6 +91,62 @@ class DesktopCapture:
                 self.user32.CloseDesktop(hdesk)
         return False
 
+    def get_monitors_list(self) -> list[dict]:
+        """Returns list of connected display monitors and virtual desktop option."""
+        try:
+            mons = win32api.EnumDisplayMonitors()
+        except Exception:
+            mons = []
+
+        results = []
+        if not mons:
+            w, h = self.get_screen_resolution()
+            results.append({"id": 0, "name": "Monitor Principale", "rect": (0, 0, w, h), "width": w, "height": h})
+            return results
+
+        for i, m in enumerate(mons):
+            rect = m[2]
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            results.append({
+                "id": i,
+                "name": f"Monitor {i + 1} ({w}x{h})",
+                "rect": rect,
+                "width": w,
+                "height": h
+            })
+
+        if len(mons) > 1:
+            vx = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            results.append({
+                "id": -1,
+                "name": "Tutti i Monitor",
+                "rect": (vx, vy, vx + vw, vy + vh),
+                "width": vw,
+                "height": vh
+            })
+
+        return results
+
+    def set_monitor(self, monitor_id: int):
+        self.current_monitor_id = monitor_id
+        self._last_dims = (0, 0, 0, 0)
+
+    def get_active_monitor_bounds(self) -> tuple[int, int, int, int]:
+        """Returns (src_x, src_y, src_w, src_h) for currently active monitor."""
+        mons = self.get_monitors_list()
+        for m in mons:
+            if m["id"] == self.current_monitor_id:
+                rect = m["rect"]
+                return (rect[0], rect[1], m["width"], m["height"])
+
+        # Fallback to primary monitor
+        w, h = self.get_screen_resolution()
+        return (0, 0, w, h)
+
     def get_screen_resolution(self) -> tuple[int, int]:
         w = self.user32.GetSystemMetrics(0)
         h = self.user32.GetSystemMetrics(1)
@@ -97,7 +160,7 @@ class DesktopCapture:
 
     def capture_frame(self) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
         """Capture the current frame, encode as JPEG, and return (jpeg_bytes, (screen_w, screen_h), (cur_x, cur_y))."""
-        screen_w, screen_h = self.get_screen_resolution()
+        src_x, src_y, screen_w, screen_h = self.get_active_monitor_bounds()
         cur_x, cur_y = self.get_cursor_position()
 
         out_w = self.target_width if self.target_width else screen_w
@@ -118,7 +181,7 @@ class DesktopCapture:
         # StretchBlt from screen to memory DC
         blt_res = self.gdi32.StretchBlt(
             self._mem_dc, 0, 0, out_w, out_h,
-            self._src_dc, 0, 0, screen_w, screen_h,
+            self._src_dc, src_x, src_y, screen_w, screen_h,
             SRCCOPY
         )
 
@@ -133,7 +196,7 @@ class DesktopCapture:
             self.gdi32.SetStretchBltMode(self._mem_dc, COLORONCOLOR)
             self.gdi32.StretchBlt(
                 self._mem_dc, 0, 0, out_w, out_h,
-                self._src_dc, 0, 0, screen_w, screen_h,
+                self._src_dc, src_x, src_y, screen_w, screen_h,
                 SRCCOPY
             )
 
@@ -142,9 +205,11 @@ class DesktopCapture:
             ci = CURSORINFO()
             ci.cbSize = ctypes.sizeof(CURSORINFO)
             if self.user32.GetCursorInfo(ctypes.byref(ci)) and (ci.flags & 1):
-                # Scale cursor position to output dimensions
-                scaled_cur_x = int(ci.ptScreenPos.x * (out_w / screen_w))
-                scaled_cur_y = int(ci.ptScreenPos.y * (out_h / screen_h))
+                # Scale cursor position relative to current monitor bounds
+                rel_cur_x = ci.ptScreenPos.x - src_x
+                rel_cur_y = ci.ptScreenPos.y - src_y
+                scaled_cur_x = int(rel_cur_x * (out_w / screen_w))
+                scaled_cur_y = int(rel_cur_y * (out_h / screen_h))
                 self.user32.DrawIcon(self._mem_dc, scaled_cur_x, scaled_cur_y, ci.hCursor)
         except Exception:
             pass
