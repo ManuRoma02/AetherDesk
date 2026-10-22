@@ -33,6 +33,7 @@ from src.ota import (
     apply_in_place_update,
     confirm_boot,
     check_boot_state,
+    cleanup_old_versions,
     OTAUpdateState,
     check_github_update,
     download_github_binary
@@ -130,6 +131,12 @@ class ClientViewerGUI:
                 self.root.iconphoto(True, self.icon_photo)
             except Exception:
                 pass
+
+        # Purge any leftover previous version backup files or staging scripts
+        try:
+            cleanup_old_versions()
+        except Exception:
+            pass
 
         self.settings = ClientSettings()
         initial_broker = self.settings.get_broker_url() if hasattr(self.settings, "get_broker_url") else broker_url

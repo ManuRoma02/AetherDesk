@@ -21,7 +21,7 @@ import asyncio
 from src.security import SecurityManager
 from src.host_daemon import HostDaemon
 from src.signaling_broker import SignalingBroker
-from src.ota import get_app_version
+from src.ota import get_app_version, cleanup_old_versions
 
 # ==============================================================================
 # DESIGN SYSTEM TOKENS - Apple Dark & High-End Studio
@@ -101,6 +101,11 @@ class HostControlPanel:
                 self.root.iconphoto(True, self.icon_photo)
             except Exception:
                 pass
+
+        try:
+            cleanup_old_versions()
+        except Exception:
+            pass
 
         self.security = SecurityManager()
         self.daemon = None

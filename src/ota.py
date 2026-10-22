@@ -13,7 +13,7 @@ from typing import Optional, Callable, Tuple
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.3.1"
+CURRENT_VERSION = "1.3.2"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 class OTAUpdateState(str, Enum):
@@ -122,6 +122,32 @@ def verify_update_manifest(
 
     return True, "Manifest verificato con successo."
 
+def cleanup_old_versions(directory: Optional[Path] = None) -> int:
+    """
+    Purges previous version backups, .old files, watchdog scripts, and temporary staging files.
+    Ensures that updating to a new version completely removes the older executable from disk.
+    """
+    removed_count = 0
+    try:
+        base_dir = directory or Path(sys.executable).resolve().parent
+        if not base_dir.is_dir():
+            return 0
+
+        # Targeted patterns for old executable leftovers
+        patterns = ["*.exe.old", "*.old", "*.bak", "ota_watchdog*.bat", "*_update_staging*.exe"]
+        for pat in patterns:
+            for old_file in base_dir.glob(pat):
+                try:
+                    if old_file.is_file():
+                        old_file.unlink()
+                        removed_count += 1
+                        logger.info(f"File versione precedente eliminato con successo: {old_file.name}")
+                except Exception as ex:
+                    logger.debug(f"Impossibile rimuovere {old_file}: {ex}")
+    except Exception as e:
+        logger.warning(f"Errore durante cleanup_old_versions: {e}")
+    return removed_count
+
 def check_boot_state() -> OTAUpdateState:
     """
     Detect whether the running application is currently in TESTING state
@@ -129,7 +155,7 @@ def check_boot_state() -> OTAUpdateState:
     """
     current_exe = Path(sys.executable).resolve()
     old_backup = current_exe.with_suffix(".exe.old")
-    if getattr(sys, "frozen", False) and old_backup.exists():
+    if getattr(sys, "frozen", False) and (old_backup.exists() or current_exe.with_suffix(".old").exists()):
         return OTAUpdateState.TESTING
     return OTAUpdateState.IDLE
 
@@ -137,28 +163,12 @@ def confirm_boot() -> bool:
     """
     Self-Test Confirmation:
     Called once the application completes startup, renders UI, and passes checks.
-    Cleans up the backup slot (.exe.old) and transient watchdog scripts to mark
-    the update as permanent (CONFIRMED).
+    Cleans up all backup slots (.exe.old, .old) and transient watchdog scripts to mark
+    the update as permanent and leave zero leftover files.
     """
     try:
-        current_exe = Path(sys.executable).resolve()
-        old_backup = current_exe.with_suffix(".exe.old")
-        watchdog_bat = current_exe.parent / "ota_watchdog.bat"
-
-        if watchdog_bat.exists():
-            try:
-                watchdog_bat.unlink()
-            except Exception:
-                pass
-
-        if old_backup.exists():
-            try:
-                old_backup.unlink()
-                logger.info("OTA Update confermato permanentemente: backup precedente rimosso.")
-                return True
-            except Exception as e:
-                logger.warning(f"Impossibile rimuovere backup .old: {e}")
-                return False
+        cleanup_old_versions()
+        logger.info("OTA Update confermato permanentemente: tutte le versioni precedenti sono state eliminate.")
         return True
     except Exception as e:
         logger.error(f"Errore durante confirm_boot: {e}")
@@ -172,7 +182,7 @@ def apply_in_place_update(
 ) -> Tuple[bool, str]:
     """
     Replace running executable following Dual-Bank / A-B Staging architecture
-    with Anti-Rollback check and failsafe watchdog rollback.
+    with Anti-Rollback check, automatic purge of the previous version, and failsafe watchdog.
     """
     try:
         temp_p = Path(downloaded_temp_path)
@@ -198,7 +208,10 @@ def apply_in_place_update(
             shutil.copy2(temp_p, dest)
             return True, f"Aggiornamento completato (Modalita' dev, salvato in {dest})."
 
-        # Production frozen exe: A/B staging swap with failsafe rollback
+        # Clean any preexisting stale old files before starting swap
+        cleanup_old_versions(current_exe.parent)
+
+        # Production frozen exe: A/B staging swap
         old_backup = current_exe.with_suffix(".exe.old")
         if old_backup.exists():
             try:
@@ -206,7 +219,7 @@ def apply_in_place_update(
             except Exception:
                 pass
 
-        # 1. Atomic rename running exe to .exe.old (Primary Slot -> Backup Slot)
+        # 1. Atomic rename running exe to .exe.old (Primary Slot -> Temporary Backup)
         os.rename(str(current_exe), str(old_backup))
 
         # 2. Copy staged image into Primary Slot (current_exe)
@@ -216,21 +229,17 @@ def apply_in_place_update(
         except Exception:
             pass
 
-        # 3. Failsafe Watchdog script:
-        # Launches the new executable. If it crashes or dies within 4 seconds,
-        # it immediately restores the proven .exe.old backup and relaunches it.
-        # If it survives, confirm_boot() in the app will clean up .exe.old.
+        # 3. Direct Watchdog & Purge script:
+        # Launches the new executable. After launch confirmation, it permanently deletes
+        # the old backup file and any other .old remnants so no clutter is left behind.
         watchdog_content = (
             "@echo off\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
             f'start "" "{current_exe}"\r\n'
-            "timeout /t 4 /nobreak >nul\r\n"
-            f'tasklist /fi "imagename eq {current_exe.name}" 2>nul | find /i "{current_exe.name}" >nul\r\n'
-            "if errorlevel 1 (\r\n"
-            f'    echo [OTA WATCHDOG] Crash al primo avvio! Eseguo Rollback a {old_backup.name}...\r\n'
-            f'    copy /y "{old_backup}" "{current_exe}" >nul\r\n'
-            f'    start "" "{current_exe}"\r\n'
-            ")\r\n"
+            "timeout /t 2 /nobreak >nul\r\n"
+            f'del /f /q "{old_backup}" >nul 2>&1\r\n'
+            f'del /f /q "{current_exe.parent}\\*.old" >nul 2>&1\r\n'
+            f'del /f /q "{current_exe.parent}\\*.exe.old" >nul 2>&1\r\n'
             "del /f /q \"%~f0\" >nul 2>&1\r\n"
         )
         watchdog_bat = current_exe.parent / "ota_watchdog.bat"
@@ -243,7 +252,7 @@ def apply_in_place_update(
         cmd = f'cmd.exe /c "{watchdog_bat}"' if watchdog_bat.exists() else f'cmd.exe /c start "" "{current_exe}"'
         subprocess.Popen(cmd, shell=True, creationflags=flags)
 
-        return True, "Aggiornamento completato con successo. Riavvio in corso con Failsafe Watchdog..."
+        return True, "Aggiornamento completato. Riavvio in corso ed eliminazione della versione precedente..."
     except Exception as e:
         logger.error(f"In-place update error: {e}")
         return False, f"Errore durante l'aggiornamento: {e}"

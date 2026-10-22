@@ -61,3 +61,23 @@ def test_escape_fullscreen_exit():
     res = ClientViewerGUI._on_escape_press(mock_gui, mock_event)
     assert res == "break"
     mock_gui._toggle_fullscreen.assert_called_once()
+
+def test_standalone_binary_health_check():
+    """Verify that the compiled standalone AetherDesk.exe executes cleanly without missing module crashes."""
+    import os
+    exe_path = os.path.join("dist", "AetherDesk.exe")
+    if not os.path.exists(exe_path):
+        pytest.skip("Standalone binary not found in dist/AetherDesk.exe - skipping binary test.")
+
+    # 1. Test --version
+    res_ver = subprocess.run([exe_path, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5)
+    assert res_ver.returncode == 0, f"Binary --version failed: {res_ver.stderr}"
+    assert "AetherDesk" in res_ver.stdout
+    assert "ModuleNotFoundError" not in res_ver.stderr
+    assert "Traceback" not in res_ver.stderr
+
+    # 2. Test --help
+    res_help = subprocess.run([exe_path, "--help"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5)
+    assert res_help.returncode == 0, f"Binary --help failed: {res_help.stderr}"
+    assert "--connect" in res_help.stdout
+    assert "ModuleNotFoundError" not in res_help.stderr

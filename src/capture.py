@@ -1,8 +1,17 @@
+import io
 import ctypes
 from ctypes import wintypes
-import cv2
-import numpy as np
+from PIL import Image
 import win32api
+
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    cv2 = None
+    np = None
+    HAS_CV2 = False
 
 # Win32 Constants
 DESKTOP_READOBJECTS = 0x0001
@@ -243,26 +252,54 @@ class DesktopCapture:
         self.gdi32.GetDIBits(self._mem_dc, self._bitmap, 0, out_h, self._buffer, ctypes.byref(bmi), 0)
 
         # Encode to JPEG
-        arr = np.frombuffer(self._buffer, dtype=np.uint8).reshape((out_h, out_w, 4))
-        # Keep BGR channels
-        bgr = arr[:, :, :3]
-
         cur_pos = (cur_x, cur_y)
-        # Fast change detection via downsampled thumbnail
-        thumb = cv2.resize(bgr, (32, 18), interpolation=cv2.INTER_NEAREST)
-        if only_if_changed and self._last_thumb is not None:
-            if cur_pos == self._last_cursor and np.array_equal(thumb, self._last_thumb):
-                # No change in screen or cursor
-                return (None, (screen_w, screen_h), cur_pos)
 
-        self._last_thumb = thumb
-        self._last_cursor = cur_pos
+        if HAS_CV2 and cv2 is not None and np is not None:
+            # High-speed OpenCV path
+            arr = np.frombuffer(self._buffer, dtype=np.uint8).reshape((out_h, out_w, 4))
+            bgr = arr[:, :, :3]
 
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-        success, enc = cv2.imencode('.jpg', bgr, encode_params)
+            thumb = cv2.resize(bgr, (32, 18), interpolation=cv2.INTER_NEAREST)
+            if only_if_changed and self._last_thumb is not None:
+                is_same_thumb = False
+                if isinstance(self._last_thumb, np.ndarray):
+                    is_same_thumb = np.array_equal(thumb, self._last_thumb)
+                elif isinstance(self._last_thumb, bytes):
+                    is_same_thumb = (thumb.tobytes() == self._last_thumb)
 
-        jpeg_bytes = enc.tobytes() if success else b""
-        return (jpeg_bytes, (screen_w, screen_h), (cur_x, cur_y))
+                if cur_pos == self._last_cursor and is_same_thumb:
+                    return (None, (screen_w, screen_h), cur_pos)
+
+            self._last_thumb = thumb
+            self._last_cursor = cur_pos
+
+            encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+            success, enc = cv2.imencode('.jpg', bgr, encode_params)
+            jpeg_bytes = enc.tobytes() if success else b""
+        else:
+            # Native Pillow fallback (zero C-extension dependency, bundled in standalone binary)
+            img = Image.frombuffer("RGBA", (out_w, out_h), self._buffer, "raw", "BGRA", 0, 1)
+            thumb = img.resize((32, 18), Image.Resampling.NEAREST)
+            thumb_bytes = thumb.tobytes()
+
+            if only_if_changed and self._last_thumb is not None:
+                is_same_thumb = False
+                if isinstance(self._last_thumb, bytes):
+                    is_same_thumb = (thumb_bytes == self._last_thumb)
+                elif hasattr(self._last_thumb, "tobytes"):
+                    is_same_thumb = (thumb_bytes == self._last_thumb.tobytes())
+
+                if cur_pos == self._last_cursor and is_same_thumb:
+                    return (None, (screen_w, screen_h), cur_pos)
+
+            self._last_thumb = thumb_bytes
+            self._last_cursor = cur_pos
+
+            bio = io.BytesIO()
+            img.convert("RGB").save(bio, format="JPEG", quality=self.quality)
+            jpeg_bytes = bio.getvalue()
+
+        return (jpeg_bytes, (screen_w, screen_h), cur_pos)
 
     def _cleanup_gdi(self):
         if self._bitmap:

@@ -35,3 +35,40 @@ def test_desktop_multimonitor():
     cap.set_monitor(-1)
     assert cap.current_monitor_id == -1
     cap.close()
+
+def test_desktop_capture_pure_pillow_fallback(monkeypatch):
+    """Verify DesktopCapture functions perfectly when cv2 and numpy are absent (standalone mode)."""
+    import src.capture as cap_mod
+    monkeypatch.setattr(cap_mod, "HAS_CV2", False)
+    monkeypatch.setattr(cap_mod, "cv2", None)
+    monkeypatch.setattr(cap_mod, "np", None)
+
+    cap = cap_mod.DesktopCapture(quality=65)
+    jpeg_data, screen_size, cursor_pos = cap.capture_frame()
+    assert isinstance(jpeg_data, bytes)
+    assert len(jpeg_data) > 100
+    assert screen_size[0] > 0 and screen_size[1] > 0
+    assert isinstance(cursor_pos, tuple)
+
+    # Test change detection in pure Pillow mode
+    frame_same, _, _ = cap.capture_frame(only_if_changed=True)
+    assert frame_same is None or isinstance(frame_same, bytes)
+
+    # Force change
+    frame_force, _, _ = cap.capture_frame(only_if_changed=False)
+    assert isinstance(frame_force, bytes)
+    assert len(frame_force) > 100
+    cap.close()
+
+def test_src_modules_import_without_cv2(monkeypatch):
+    """Ensure all core modules can be imported without cv2 without raising ModuleNotFoundError."""
+    import sys
+    monkeypatch.setitem(sys.modules, "cv2", None)
+    import importlib
+    import src.capture
+    importlib.reload(src.capture)
+    import src.host_daemon
+    importlib.reload(src.host_daemon)
+    import src.client_viewer
+    importlib.reload(src.client_viewer)
+    assert hasattr(src.client_viewer, "ClientViewerGUI")

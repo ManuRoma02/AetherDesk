@@ -28,17 +28,17 @@ def test_ota_states():
     assert OTAUpdateState.TESTING == "TESTING"
 
 def test_version_helpers():
-    assert get_app_version() == "1.3.1"
-    assert parse_version("1.3.1") == (1, 3, 1)
+    assert get_app_version() == "1.3.2"
+    assert parse_version("1.3.2") == (1, 3, 2)
     assert parse_version("1.3") == (1, 3, 0)
     assert parse_version("v1.4.2") == (1, 4, 2)
-    assert parse_version("1.3.1.4") == (1, 3, 1, 4)
-    assert is_newer_version("1.3.2", "1.3.1") is True
-    assert is_newer_version("1.4", "1.3.1") is True
-    assert is_newer_version("2.0.0", "1.3.1") is True
-    assert is_newer_version("1.3.1", "1.3.1") is False
-    assert is_newer_version("1.3", "1.3.1") is False
-    assert is_newer_version("1.2.9", "1.3.1") is False
+    assert parse_version("1.3.2.4") == (1, 3, 2, 4)
+    assert is_newer_version("1.3.3", "1.3.2") is True
+    assert is_newer_version("1.4", "1.3.2") is True
+    assert is_newer_version("2.0.0", "1.3.2") is True
+    assert is_newer_version("1.3.2", "1.3.2") is False
+    assert is_newer_version("1.3", "1.3.2") is False
+    assert is_newer_version("1.2.9", "1.3.2") is False
 
 def test_verify_update_manifest():
     # Valid manifest
@@ -112,6 +112,30 @@ def test_confirm_boot_and_state():
     state = check_boot_state()
     assert state in (OTAUpdateState.IDLE, OTAUpdateState.TESTING)
     assert confirm_boot() is True
+
+def test_cleanup_old_versions(tmp_path):
+    from src.ota import cleanup_old_versions
+    # Setup mock old leftover files
+    old1 = tmp_path / "AetherDesk.exe.old"
+    old2 = tmp_path / "AetherDesk.old"
+    old3 = tmp_path / "legacy.bak"
+    watchdog = tmp_path / "ota_watchdog.bat"
+    staging = tmp_path / "temp_update_staging.exe"
+    active_exe = tmp_path / "AetherDesk.exe"
+
+    for p in [old1, old2, old3, watchdog, staging, active_exe]:
+        p.write_bytes(b"TEST_DATA")
+
+    # Run cleanup
+    count = cleanup_old_versions(tmp_path)
+    assert count >= 5
+    assert not old1.exists()
+    assert not old2.exists()
+    assert not old3.exists()
+    assert not watchdog.exists()
+    assert not staging.exists()
+    # The active executable must be preserved!
+    assert active_exe.exists()
 
 def test_github_update_check():
     from src.ota import check_github_update
