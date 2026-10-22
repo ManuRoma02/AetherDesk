@@ -1,0 +1,39 @@
+version: 1
+project:
+  name: "aetherdesk"
+
+metadata:
+  ota:
+    minimum_version: "1.0.0"
+
+tasks:
+  test:
+    description: "Esegue la suite completa di test unitari e di integrazione pytest"
+    command:
+      exe: "pytest"
+      args: ["-q"]
+
+  build:
+    description: "Compila l'eseguibile standalone AetherDesk.exe con PyInstaller"
+    command:
+      exe: "cmd.exe"
+      args: ["/c", "scripts\\build_exe.bat"]
+
+  start-host:
+    description: "Avvia l'interfaccia host nella traybar e il demone di acquisizione"
+    command:
+      exe: "python"
+      args: ["src\\host_tray.py"]
+
+  start-client:
+    description: "Avvia il visualizzatore desktop remoto portatile (ClientViewer)"
+    command:
+      exe: "python"
+      args: ["src\\client_viewer.py"]
+
+  allow-firewall:
+    description: "Apre la porta 8765 nel Windows Defender Firewall per LAN/Wi-Fi"
+    command:
+      exe: "cmd.exe"
+      args: ["/c", "scripts\\allow_firewall.bat"]
+

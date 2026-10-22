@@ -1,6 +1,14 @@
 import asyncio
 import logging
 from typing import Dict, Any, Optional
+from pathlib import Path
+import sys
+
+# Ensure repository root is in sys.path
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 import websockets
 from src.protocol import ProtocolMessage
 
@@ -107,7 +115,12 @@ class SignalingBroker:
                 del self.routes[peer]
 
     async def start(self):
-        self.server = await websockets.serve(self.handle_connection, self.host, self.port)
+        self.server = await websockets.serve(
+            self.handle_connection,
+            self.host,
+            self.port,
+            max_size=16 * 1024 * 1024
+        )
         logger.info(f"Signaling broker listening on ws://{self.host}:{self.port}")
 
     async def stop(self):
@@ -115,11 +128,37 @@ class SignalingBroker:
             self.server.close()
             await self.server.wait_closed()
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    broker = SignalingBroker(port=8765)
-    asyncio.run(broker.start())
+async def _run_broker(host: str, port: int):
+    broker = SignalingBroker(host=host, port=port)
+    await broker.start()
     try:
-        asyncio.get_event_loop().run_forever()
-    except KeyboardInterrupt:
+        # Keep running until cancelled or interrupted
+        await asyncio.Future()
+    except asyncio.CancelledError:
         pass
+    finally:
+        await broker.stop()
+
+if __name__ == "__main__":
+    import argparse
+    from src.ota import get_app_version
+
+    parser = argparse.ArgumentParser(
+        description="AetherDesk Signaling Broker - Zero-Knowledge E2EE Rendezvous Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python src/signaling_broker.py
+  python src/signaling_broker.py --host 0.0.0.0 --port 8765
+        """
+    )
+    parser.add_argument("-H", "--host", default="0.0.0.0", help="Host address to bind (default: 0.0.0.0)")
+    parser.add_argument("-p", "--port", type=int, default=8765, help="Port to listen on (default: 8765)")
+    parser.add_argument("-v", "--version", action="version", version=f"AetherDesk Broker v{get_app_version()}")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    try:
+        asyncio.run(_run_broker(args.host, args.port))
+    except KeyboardInterrupt:
+        print("\nBroker arrestato dall'utente.")

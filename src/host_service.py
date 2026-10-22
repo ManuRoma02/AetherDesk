@@ -5,6 +5,9 @@ import asyncio
 import logging
 from pathlib import Path
 
+# Ensure project root is in sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # Setup logging to ProgramData
 log_dir = Path(os.environ.get("ProgramData", "C:\\ProgramData")) / "RemoteDesktop"
 log_dir.mkdir(parents=True, exist_ok=True)

@@ -63,9 +63,9 @@ async def test_repro_broker_forwards_all_remote_desktop_messages():
     assert bin_data == b"fake_input"
 
 
-def test_repro_mutual_session_key_derivation():
+def test_repro_mutual_session_key_derivation(tmp_path):
     """Verify host and client derive identical session keys from the user password."""
-    sec = SecurityManager()
+    sec = SecurityManager(config_dir=str(tmp_path))
     sec.set_password("MyStrongPass2026")
     host_salt = bytes.fromhex(sec.config["pwd_salt"])
     master_key_host = bytes.fromhex(sec.config["master_key"])

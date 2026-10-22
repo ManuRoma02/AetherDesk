@@ -31,3 +31,9 @@ def test_daemon_auth_and_input_handling(tmp_path):
     encrypted = daemon.security.encrypt_packet(plaintext_input, key)
     res = daemon.handle_client_message("INPUT", {}, encrypted, session_state)
     assert res is not None
+
+def test_daemon_set_quality(tmp_path):
+    daemon = HostDaemon(config_dir=str(tmp_path), headless=True)
+    res = daemon.handle_client_message("SET_QUALITY", {"quality": 85}, None, {})
+    assert res is not None
+    assert daemon.capture.quality == 85

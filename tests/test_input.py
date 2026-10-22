@@ -10,21 +10,26 @@ def test_input_handler_mouse_events():
     handler = InputHandler()
     # Test valid calls don't raise
     handler.move_mouse(0.1, 0.1)
-    handler.mouse_down("left")
-    handler.mouse_up("left")
-    handler.mouse_wheel(120)
+    handler.mouse_down("left", norm_x=0.2, norm_y=0.2)
+    handler.mouse_up("left", norm_x=0.2, norm_y=0.2)
+    handler.mouse_down("right", norm_x=0.3, norm_y=0.3)
+    handler.mouse_up("right", norm_x=0.3, norm_y=0.3)
+    handler.mouse_wheel(120, norm_x=0.2, norm_y=0.2)
 
 def test_input_handler_keyboard_events():
     handler = InputHandler()
     handler.key_down(0x41) # 'A'
     handler.key_up(0x41)
+    handler.send_unicode_char("€")
+    handler.send_unicode_char("à")
 
 def test_input_handler_special_keys():
     handler = InputHandler()
-    res = handler.send_special("win_d")
-    assert res is True
-    res_bad = handler.send_special("unknown_command")
-    assert res_bad is False
+    assert handler.send_special("win_d") is True
+    assert handler.send_special("alt_tab") is True
+    assert handler.send_special("task_mgr") is True
+    assert handler.send_special("lock") is True
+    assert handler.send_special("unknown_command") is False
 
 def test_input_handler_multimonitor_mapping():
     handler = InputHandler()

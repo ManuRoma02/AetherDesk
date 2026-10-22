@@ -12,6 +12,12 @@ def test_client_id_validation():
 def test_client_id_cleaning():
     assert ClientState.clean_id(" 482 910 234 ") == "482910234"
 
+def test_device_id_combobox_extraction():
+    sample = "315 747 031 (Ufficio)"
+    extracted = sample.split("(")[0].strip()
+    assert ClientState.validate_id(extracted) is True
+    assert ClientState.clean_id(extracted) == "315747031"
+
 def test_client_connection_handshake_state():
     state = ClientState()
     assert state.is_connected is False

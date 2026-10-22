@@ -7,10 +7,12 @@ from typing import Optional, Callable
 import websockets
 
 import os
+import tempfile
 from pathlib import Path
 from src.security import SecurityManager
 from src.protocol import ProtocolMessage
 from src.transfer import ClipboardManager, FileTransferManager
+from src.ota import get_app_version, compute_file_sha256, apply_in_place_update
 
 logger = logging.getLogger("RemoteClient")
 
@@ -161,6 +163,14 @@ class RemoteClient:
         self.on_status_callback: Optional[Callable[[str], None]] = None
         self.on_clipboard_callback: Optional[Callable[[str], None]] = None
         self.on_file_saved_callback: Optional[Callable[[str], None]] = None
+        self.on_ota_info_callback: Optional[Callable[[dict], None]] = None
+        self.on_ota_progress_callback: Optional[Callable[[int, int], None]] = None
+        self.on_ota_complete_callback: Optional[Callable[[bool, str], None]] = None
+        self._ota_file_size = 0
+        self._ota_sha256 = ""
+        self._ota_received_bytes = 0
+        self._ota_temp_file = None
+        self._ota_fp = None
         self.last_dev_id = ""
         self.last_password = ""
         self.auto_reconnect = True
@@ -187,7 +197,11 @@ class RemoteClient:
         self._set_status(f"Connessione a {self.broker_url}...")
 
         try:
-            self.websocket = await websockets.connect(self.broker_url)
+            # Enforce 4.0s connection timeout so the client never hangs indefinitely
+            self.websocket = await asyncio.wait_for(
+                websockets.connect(self.broker_url, open_timeout=4.0, max_size=16 * 1024 * 1024),
+                timeout=5.0
+            )
             # 1. Ask broker to connect to host ID
             salt = secrets.token_bytes(16)
             conn_msg = ProtocolMessage.serialize("CONNECT_CLIENT", {
@@ -196,7 +210,7 @@ class RemoteClient:
             })
             await self.websocket.send(conn_msg)
 
-            # Wait for response
+            # Wait for response with timeout
             resp_raw = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
             msg_type, payload, _ = ProtocolMessage.deserialize(resp_raw)
 
@@ -219,8 +233,20 @@ class RemoteClient:
 
                 # Start background receiver loop
                 asyncio.create_task(self._receive_loop())
+                # Query host for OTA update availability
+                asyncio.create_task(self.check_ota_update())
                 return True
 
+        except asyncio.TimeoutError:
+            logger.error("Connection timed out")
+            self.state.set_connecting(False)
+            self._set_status(f"Timeout: Server {self.broker_url} non risponde. Verifica che l'host sia avviato e la porta 8765 aperta nel Firewall.")
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
+            return False
         except (OSError, websockets.exceptions.WebSocketException) as e:
             logger.error(f"Connection failed: {e}")
             self.state.set_connecting(False)
@@ -268,6 +294,71 @@ class RemoteClient:
                     if self.on_file_saved_callback:
                         self.on_file_saved_callback(saved_path)
 
+                elif msg_type == "OTA_INFO":
+                    if self.on_ota_info_callback:
+                        self.on_ota_info_callback(payload)
+
+                elif msg_type == "OTA_START":
+                    self._ota_file_size = payload.get("filesize", 0)
+                    self._ota_sha256 = payload.get("sha256", "")
+                    self._ota_received_bytes = 0
+                    if self._ota_fp:
+                        try:
+                            self._ota_fp.close()
+                        except Exception:
+                            pass
+                    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
+                    self._ota_temp_file = tf.name
+                    tf.close()
+                    self._ota_fp = open(self._ota_temp_file, "wb")
+                    if self.on_ota_progress_callback:
+                        self.on_ota_progress_callback(0, self._ota_file_size)
+
+                elif msg_type == "OTA_CHUNK" and binary:
+                    if self._ota_fp:
+                        chunk = binary
+                        if self.state.session_key:
+                            try:
+                                chunk = self.security.decrypt_packet(binary, self.state.session_key)
+                            except Exception:
+                                chunk = binary
+                        self._ota_fp.write(chunk)
+                        self._ota_received_bytes += len(chunk)
+                        if self.on_ota_progress_callback:
+                            self.on_ota_progress_callback(self._ota_received_bytes, self._ota_file_size)
+
+                elif msg_type == "OTA_FINISH":
+                    if self._ota_fp:
+                        try:
+                            self._ota_fp.close()
+                        except Exception:
+                            pass
+                        self._ota_fp = None
+                    expected_sha = payload.get("sha256", self._ota_sha256)
+                    if self._ota_temp_file and Path(self._ota_temp_file).exists():
+                        actual_sha = compute_file_sha256(self._ota_temp_file)
+                        if expected_sha and actual_sha.lower() != expected_sha.lower():
+                            if self.on_ota_complete_callback:
+                                self.on_ota_complete_callback(False, f"Checksum SHA-256 non valido (Atteso: {expected_sha[:8]}..., Calcolato: {actual_sha[:8]}...).")
+                        else:
+                            ok, msg = apply_in_place_update(self._ota_temp_file, target_version=payload.get("version"))
+                            if self.on_ota_complete_callback:
+                                self.on_ota_complete_callback(ok, msg)
+                    else:
+                        if self.on_ota_complete_callback:
+                            self.on_ota_complete_callback(False, "File OTA non trovato.")
+
+                elif msg_type == "OTA_ERROR":
+                    if self._ota_fp:
+                        try:
+                            self._ota_fp.close()
+                        except Exception:
+                            pass
+                        self._ota_fp = None
+                    err = payload.get("error", "Errore durante l'aggiornamento.")
+                    if self.on_ota_complete_callback:
+                        self.on_ota_complete_callback(False, err)
+
         except (websockets.exceptions.ConnectionClosed, Exception) as e:
             logger.warning(f"Connection lost: {e}")
             if self.auto_reconnect and self.last_dev_id and not self.state.is_reconnecting:
@@ -312,6 +403,13 @@ class RemoteClient:
         if not self.state.is_connected or not self.websocket:
             return
         msg = ProtocolMessage.serialize("SWITCH_MONITOR", {"target_id": self.state.target_id, "monitor_id": monitor_id})
+        await self.websocket.send(msg)
+
+    async def set_quality(self, quality: int):
+        """Set JPEG compression quality on remote host (1-100)."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("SET_QUALITY", {"target_id": self.state.target_id, "quality": quality})
         await self.websocket.send(msg)
 
     async def send_file(self, file_path: str, progress_callback=None):
@@ -363,6 +461,26 @@ class RemoteClient:
             await self.websocket.send(msg)
         except Exception as e:
             logger.error(f"Failed to send input: {e}")
+
+    async def check_ota_update(self):
+        """Ask host for available OTA updates."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("OTA_CHECK", {"target_id": self.state.target_id})
+        try:
+            await self.websocket.send(msg)
+        except Exception as e:
+            logger.warning(f"Failed to send OTA_CHECK: {e}")
+
+    async def request_ota_update(self):
+        """Request host to stream OTA update executable."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("OTA_REQUEST", {"target_id": self.state.target_id})
+        try:
+            await self.websocket.send(msg)
+        except Exception as e:
+            logger.warning(f"Failed to send OTA_REQUEST: {e}")
 
     async def disconnect(self):
         self.auto_reconnect = False
