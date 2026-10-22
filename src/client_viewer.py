@@ -3,6 +3,7 @@ import os
 import sys
 import asyncio
 import threading
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
@@ -18,10 +19,15 @@ class ClientViewerGUI:
         self.root.geometry("460x440")
         self.root.configure(bg="#0a0c14")
 
-        # Set official window icon
-        icon_path = Path(__file__).parent.parent / "assets" / "icon.png"
+        # Set official window icon (handles frozen PyInstaller package vs dev)
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            base_dir = Path(sys._MEIPASS)
+        else:
+            base_dir = Path(__file__).resolve().parent.parent
+
+        icon_path = base_dir / "assets" / "icon.png"
         if not icon_path.exists():
-            icon_path = Path(__file__).parent / "assets" / "icon.png"
+            icon_path = Path(__file__).resolve().parent / "assets" / "icon.png"
         if icon_path.exists():
             try:
                 self.icon_photo = tk.PhotoImage(file=str(icon_path))

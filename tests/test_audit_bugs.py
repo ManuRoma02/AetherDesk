@@ -84,3 +84,15 @@ def test_repro_mutual_session_key_derivation():
     msg = sec.encrypt_packet(b"hello client", host_session_key)
     dec = sec.decrypt_packet(msg, client_session_key)
     assert dec == b"hello client"
+
+
+def test_repro_client_viewer_gui_init():
+    """Verify ClientViewerGUI initializes without NameError on Path or missing assets."""
+    from src.client_viewer import ClientViewerGUI
+    gui = ClientViewerGUI()
+    try:
+        assert gui.root is not None
+        assert "AetherDesk" in gui.root.title()
+    finally:
+        gui.root.destroy()
+
