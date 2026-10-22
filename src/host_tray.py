@@ -21,9 +21,58 @@ import asyncio
 from src.security import SecurityManager
 from src.host_daemon import HostDaemon
 from src.signaling_broker import SignalingBroker
+from src.ota import get_app_version
+
+# ==============================================================================
+# DESIGN SYSTEM TOKENS - Apple Dark & High-End Studio
+# ==============================================================================
+THEME = {
+    "bg": "#090b11",              # Deep space obsidian
+    "card": "#131622",            # Elevated Bento surface
+    "card_border": "#212638",     # Refined 1px card outline
+    "card_hover": "#1a1f30",      # Hover on card items
+    "input_bg": "#0e1018",        # Inset field background
+    "input_border": "#252b3e",    # Subtle input border
+    "input_focus": "#38bdf8",     # Electric cyan focus ring
+    "accent": "#0284c7",          # Apple System Blue
+    "accent_hover": "#0ea5e9",    # Vibrant blue hover
+    "cyan": "#38bdf8",            # Brand cyan
+    "text_main": "#f8fafc",       # Primary crisp text
+    "text_muted": "#94a3b8",      # Secondary clean text
+    "text_dim": "#64748b",        # Caption / hint text
+    "success": "#10b981",         # Emerald success / connected
+    "warning": "#f59e0b",         # Amber
+    "danger": "#ef4444",          # Crimson disconnect
+}
+
+def bind_hover(widget, normal_bg, hover_bg, normal_fg=None, hover_fg=None):
+    """Instant, tactile micro-interaction hover feedback (Emil Kowalski rule)."""
+    def on_enter(e):
+        try:
+            if widget.cget("state") != "disabled":
+                widget.config(bg=hover_bg)
+                if hover_fg:
+                    widget.config(fg=hover_fg)
+        except Exception:
+            pass
+    def on_leave(e):
+        try:
+            if widget.cget("state") != "disabled":
+                widget.config(bg=normal_bg)
+                if normal_fg:
+                    widget.config(fg=normal_fg)
+        except Exception:
+            pass
+    widget.bind("<Enter>", on_enter)
+    widget.bind("<Leave>", on_leave)
+
+def bind_focus_ring(entry_widget, container_frame, normal_border=THEME["input_border"], focus_border=THEME["input_focus"]):
+    entry_widget.bind("<FocusIn>", lambda e: container_frame.config(highlightbackground=focus_border))
+    entry_widget.bind("<FocusOut>", lambda e: container_frame.config(highlightbackground=normal_border))
+
 
 class HostControlPanel:
-    """Desktop Host Control Panel to view Device ID, configure password and monitor status."""
+    """Desktop Host Control Panel with Apple HIG dark-mode Bento architecture."""
 
     @staticmethod
     def _center_window(win: tk.Tk, width: int, height: int):
@@ -40,8 +89,8 @@ class HostControlPanel:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("AetherDesk - Pannello Host")
-        self._center_window(self.root, 520, 630)
-        self.root.configure(bg="#0a0c14")
+        self._center_window(self.root, 520, 680)
+        self.root.configure(bg=THEME["bg"])
         self.root.resizable(False, False)
 
         # Set official window icon
@@ -88,123 +137,163 @@ class HostControlPanel:
         return endpoints
 
     def _build_ui(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TLabel", background="#0a0c14", foreground="#cdd6f4", font=("Segoe UI", 10))
-        style.configure("Header.TLabel", background="#0a0c14", foreground="#38bdf8", font=("Segoe UI", 18, "bold"))
-        style.configure("SubHeader.TLabel", background="#0a0c14", foreground="#94a3b8", font=("Segoe UI", 9))
-        style.configure("ID.TLabel", background="#141726", foreground="#38bdf8", font=("Consolas", 22, "bold"))
-
-        container = tk.Frame(self.root, bg="#0a0c14", padx=25, pady=16)
+        container = tk.Frame(self.root, bg=THEME["bg"], padx=26, pady=20)
         container.pack(fill=tk.BOTH, expand=True)
 
-        header = ttk.Label(container, text="AETHERDESK HOST", style="Header.TLabel")
-        header.pack(pady=(0, 2))
+        # 1. Header Bar
+        header_bar = tk.Frame(container, bg=THEME["bg"])
+        header_bar.pack(fill=tk.X, pady=(0, 16))
 
-        sub = ttk.Label(container, text="Host Non Presidiato - Pronto all'ascolto", style="SubHeader.TLabel")
-        sub.pack(pady=(0, 10))
+        title_row = tk.Frame(header_bar, bg=THEME["bg"])
+        title_row.pack(anchor="w")
 
-        # Device ID Card
-        id_frame = tk.Frame(container, bg="#141726", padx=15, pady=10, highlightbackground="#282e44", highlightthickness=1)
-        id_frame.pack(fill=tk.X, pady=(0, 10))
+        lbl_dot = tk.Label(title_row, text="●", bg=THEME["bg"], fg=THEME["cyan"], font=("Segoe UI", 12, "bold"))
+        lbl_dot.pack(side=tk.LEFT, padx=(0, 6))
 
-        lbl_id_title = tk.Label(id_frame, text="IL TUO ID DISPOSITIVO:", bg="#141726", fg="#94a3b8", font=("Segoe UI", 9, "bold"))
-        lbl_id_title.pack(anchor="w")
+        lbl_brand = tk.Label(title_row, text="AETHERDESK HOST", bg=THEME["bg"], fg=THEME["text_main"],
+                             font=("Segoe UI", 16, "bold"))
+        lbl_brand.pack(side=tk.LEFT)
 
-        id_row = tk.Frame(id_frame, bg="#141726")
-        id_row.pack(fill=tk.X, pady=2)
+        lbl_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg="#161b2b", fg=THEME["cyan"],
+                             font=("Consolas", 8, "bold"), padx=6, pady=1)
+        lbl_badge.pack(side=tk.LEFT, padx=(8, 0))
+
+        lbl_sub = tk.Label(header_bar, text="Host Non Presidiato • In ascolto connessioni remote",
+                           bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 9))
+        lbl_sub.pack(anchor="w", pady=(1, 0))
+
+        # 2. Bento Card: Device ID
+        id_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=14,
+                           highlightthickness=1, highlightbackground=THEME["card_border"])
+        id_card.pack(fill=tk.X, pady=(0, 10))
+
+        lbl_id_title = tk.Label(id_card, text="●  IL TUO ID DISPOSITIVO (DA DARE AL CLIENT)", bg=THEME["card"],
+                                fg=THEME["cyan"], font=("Segoe UI", 8, "bold"))
+        lbl_id_title.pack(anchor="w", pady=(0, 6))
+
+        id_val_box = tk.Frame(id_card, bg="#0d101a", padx=12, pady=8,
+                              highlightthickness=1, highlightbackground=THEME["input_border"])
+        id_val_box.pack(fill=tk.X)
 
         dev_id = self.security.get_or_create_device_id()
-        self.lbl_id = tk.Label(id_row, text=dev_id, bg="#141726", fg="#fbbf24", font=("Consolas", 20, "bold"))
+        self.lbl_id = tk.Label(id_val_box, text=dev_id, bg="#0d101a", fg="#fbbf24",
+                               font=("Consolas", 22, "bold"))
         self.lbl_id.pack(side=tk.LEFT)
 
-        btn_copy = tk.Button(id_row, text="Copia ID", bg="#1e293b", fg="#cdd6f4", relief="flat",
-                             font=("Segoe UI", 9), cursor="hand2", command=self._copy_id)
+        btn_copy = tk.Button(id_val_box, text="📋 Copia ID", bg="#1b2032", fg=THEME["text_main"],
+                             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=3,
+                             command=self._copy_id)
         btn_copy.pack(side=tk.RIGHT)
+        bind_hover(btn_copy, "#1b2032", "#262d44", THEME["text_main"], THEME["cyan"])
 
-        # Network Endpoints Card (Where to find server URL for Client)
-        net_frame = tk.Frame(container, bg="#141726", padx=15, pady=10, highlightbackground="#282e44", highlightthickness=1)
-        net_frame.pack(fill=tk.X, pady=(0, 10))
+        # 3. Bento Card: Password Config
+        pwd_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=12,
+                            highlightthickness=1, highlightbackground=THEME["card_border"])
+        pwd_card.pack(fill=tk.X, pady=(0, 10))
 
-        lbl_net_title = tk.Label(net_frame, text="INDIRIZZI BROKER DA INSERIRE NEL CLIENT:", bg="#141726", fg="#94a3b8", font=("Segoe UI", 9, "bold"))
-        lbl_net_title.pack(anchor="w", pady=(0, 4))
+        lbl_pwd_title = tk.Label(pwd_card, text="●  PASSWORD DI ACCESSO REMOTO", bg=THEME["card"],
+                                 fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+        lbl_pwd_title.pack(anchor="w", pady=(0, 6))
+
+        pwd_row = tk.Frame(pwd_card, bg=THEME["input_bg"], highlightthickness=1,
+                           highlightbackground=THEME["input_border"], padx=8, pady=3)
+        pwd_row.pack(fill=tk.X)
+
+        self.entry_pwd = tk.Entry(pwd_row, show="*", font=("Segoe UI", 11), bg=THEME["input_bg"],
+                                  fg=THEME["text_main"], insertbackground="white", relief="flat")
+        self.entry_pwd.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        self.entry_pwd.bind("<Return>", lambda e: self._save_password())
+        bind_focus_ring(self.entry_pwd, pwd_row)
+
+        self.btn_eye = tk.Button(pwd_row, text="👁", bg="#1b2032", fg=THEME["text_muted"],
+                                 font=("Segoe UI", 9), relief="flat", cursor="hand2", padx=6,
+                                 command=self._toggle_pwd_view)
+        self.btn_eye.pack(side=tk.LEFT, padx=(0, 6))
+        bind_hover(self.btn_eye, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+
+        btn_save_pwd = tk.Button(pwd_row, text="Salva Password", bg="#10b981", fg="#ffffff",
+                                 font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=2,
+                                 command=self._save_password)
+        btn_save_pwd.pack(side=tk.RIGHT)
+        bind_hover(btn_save_pwd, "#10b981", "#059669", "#ffffff", "#ffffff")
+
+        # 4. Bento Card: Network Endpoints
+        net_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=12,
+                            highlightthickness=1, highlightbackground=THEME["card_border"])
+        net_card.pack(fill=tk.X, pady=(0, 10))
+
+        lbl_net_title = tk.Label(net_card, text="●  INDIRIZZI BROKER DA INSERIRE NEL CLIENT", bg=THEME["card"],
+                                 fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+        lbl_net_title.pack(anchor="w", pady=(0, 6))
 
         for net_label, net_url in self._get_network_endpoints():
-            row = tk.Frame(net_frame, bg="#141726")
-            row.pack(fill=tk.X, pady=2)
-            lbl_l = tk.Label(row, text=f"{net_label}:", bg="#141726", fg="#cdd6f4", font=("Segoe UI", 8, "bold"), width=18, anchor="w")
+            row = tk.Frame(net_card, bg=THEME["card"], pady=2)
+            row.pack(fill=tk.X)
+
+            lbl_l = tk.Label(row, text=f"{net_label}:", bg=THEME["card"], fg=THEME["text_muted"],
+                             font=("Segoe UI", 8, "bold"), width=16, anchor="w")
             lbl_l.pack(side=tk.LEFT)
-            lbl_u = tk.Label(row, text=net_url, bg="#181c2c", fg="#34d399", font=("Consolas", 9), padx=6, pady=2)
+
+            lbl_u = tk.Label(row, text=net_url, bg=THEME["input_bg"], fg=THEME["success"],
+                             font=("Consolas", 9), padx=6, pady=2)
             lbl_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-            btn_cp_u = tk.Button(row, text="Copia", bg="#1e293b", fg="#cdd6f4", relief="flat", font=("Segoe UI", 8),
-                                 cursor="hand2", command=lambda u=net_url: self._copy_text(u, "URL Server"))
-            btn_cp_u.pack(side=tk.RIGHT)
 
-        # Password Config Card
-        pwd_frame = tk.Frame(container, bg="#141726", padx=15, pady=10, highlightbackground="#282e44", highlightthickness=1)
-        pwd_frame.pack(fill=tk.X, pady=(0, 10))
+            btn_cp = tk.Button(row, text="Copia", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
+                               font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=1,
+                               command=lambda u=net_url: self._copy_text(u, "URL"))
+            btn_cp.pack(side=tk.RIGHT)
+            bind_hover(btn_cp, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
 
-        lbl_pwd_title = tk.Label(pwd_frame, text="PASSWORD DI ACCESSO REMOTO:", bg="#141726", fg="#94a3b8", font=("Segoe UI", 9, "bold"))
-        lbl_pwd_title.pack(anchor="w", pady=(0, 4))
-
-        pwd_input_frame = tk.Frame(pwd_frame, bg="#141726")
-        pwd_input_frame.pack(fill=tk.X)
-
-        self.entry_pwd = tk.Entry(pwd_input_frame, show="*", font=("Segoe UI", 11), bg="#181c2c", fg="#f1f5f9",
-                                  insertbackground="white", relief="flat")
-        self.entry_pwd.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 4))
-        self.entry_pwd.bind("<Return>", lambda e: self._save_password())
-
-        self.btn_eye = tk.Button(pwd_input_frame, text="👁", bg="#1e293b", fg="#cdd6f4", font=("Segoe UI", 9),
-                                 relief="flat", cursor="hand2", command=self._toggle_pwd_view)
-        self.btn_eye.pack(side=tk.LEFT, ipady=2, padx=(0, 6))
-
-        btn_save_pwd = tk.Button(pwd_input_frame, text="Salva Password", bg="#10b981", fg="#ffffff",
-                                 font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", command=self._save_password)
-        btn_save_pwd.pack(side=tk.RIGHT, ipady=3, padx=2)
-
-        # Broker Config Card
-        broker_frame = tk.Frame(container, bg="#141726", padx=15, pady=8, highlightbackground="#282e44", highlightthickness=1)
-        broker_frame.pack(fill=tk.X, pady=(0, 10))
-
-        lbl_brk_title = tk.Label(broker_frame, text="OPZIONI SERVER BROKER:", bg="#141726", fg="#94a3b8", font=("Segoe UI", 9, "bold"))
-        lbl_brk_title.pack(anchor="w", pady=(0, 2))
+        # 5. Broker Checkbox & Url
+        broker_box = tk.Frame(container, bg=THEME["card"], padx=18, pady=10,
+                              highlightthickness=1, highlightbackground=THEME["card_border"])
+        broker_box.pack(fill=tk.X, pady=(0, 10))
 
         self.var_local_broker = tk.BooleanVar(value=True)
-        self.chk_local_broker = tk.Checkbutton(broker_frame, text="Avvia Server Broker Locale integrato (Porta 8765)",
-                                               variable=self.var_local_broker, bg="#141726", fg="#cdd6f4",
-                                               selectcolor="#181c2c", activebackground="#141726",
-                                               activeforeground="#cdd6f4", font=("Segoe UI", 9))
-        self.chk_local_broker.pack(anchor="w", pady=(0, 2))
+        self.chk_local_broker = tk.Checkbutton(
+            broker_box, text="Avvia Server Broker Locale integrato (Porta 8765)",
+            variable=self.var_local_broker, bg=THEME["card"], fg=THEME["text_main"],
+            selectcolor=THEME["input_bg"], activebackground=THEME["card"],
+            activeforeground=THEME["text_main"], font=("Segoe UI", 9)
+        )
+        self.chk_local_broker.pack(anchor="w", pady=(0, 4))
 
-        brk_url_frame = tk.Frame(broker_frame, bg="#141726")
-        brk_url_frame.pack(fill=tk.X)
-        lbl_brk_url = tk.Label(brk_url_frame, text="URL Ascolto:", bg="#141726", fg="#94a3b8", font=("Segoe UI", 9))
-        lbl_brk_url.pack(side=tk.LEFT, padx=(0, 5))
-        self.entry_broker = tk.Entry(brk_url_frame, font=("Segoe UI", 9), bg="#181c2c", fg="#f1f5f9",
+        brk_url_row = tk.Frame(broker_box, bg=THEME["card"])
+        brk_url_row.pack(fill=tk.X)
+
+        lbl_bu = tk.Label(brk_url_row, text="URL Ascolto:", bg=THEME["card"], fg=THEME["text_dim"], font=("Segoe UI", 9))
+        lbl_bu.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.entry_broker = tk.Entry(brk_url_row, font=("Consolas", 9), bg=THEME["input_bg"], fg=THEME["text_main"],
                                      insertbackground="white", relief="flat")
         self.entry_broker.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
         self.entry_broker.insert(0, "ws://127.0.0.1:8765")
 
-        # Status & Controls
-        self.lbl_status = tk.Label(container, text="Stato: In ascolto (Nessun client connesso)", bg="#0a0c14", fg="#38bdf8",
-                                   font=("Segoe UI", 10, "bold"))
-        self.lbl_status.pack(pady=(2, 8))
+        # 6. Status & Controls
+        self.lbl_status = tk.Label(container, text="● In ascolto (Nessun client connesso)", bg=THEME["bg"],
+                                   fg=THEME["cyan"], font=("Segoe UI", 9, "bold"))
+        self.lbl_status.pack(pady=(4, 8))
 
-        btn_frame = tk.Frame(container, bg="#0a0c14")
-        btn_frame.pack(fill=tk.X)
+        btn_row = tk.Frame(container, bg=THEME["bg"])
+        btn_row.pack(fill=tk.X)
 
-        self.btn_daemon = tk.Button(btn_frame, text="Arresta Demone", bg="#ef4444", fg="#ffffff",
-                                    font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", command=self._toggle_daemon)
-        self.btn_daemon.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=(0, 3))
+        self.btn_daemon = tk.Button(btn_row, text="Arresta Demone", bg="#ef4444", fg="#ffffff",
+                                    font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+                                    command=self._toggle_daemon)
+        self.btn_daemon.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 4))
+        bind_hover(self.btn_daemon, "#ef4444", "#dc2626", "#ffffff", "#ffffff")
 
-        btn_fw = tk.Button(btn_frame, text="Sblocca Firewall", bg="#f59e0b", fg="#0a0c14",
-                           font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", command=self._open_firewall_unblock)
-        btn_fw.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=3)
+        btn_fw = tk.Button(btn_row, text="🛡 Sblocca Firewall", bg="#1b2032", fg=THEME["warning"],
+                           font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+                           command=self._open_firewall_unblock)
+        btn_fw.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=4)
+        bind_hover(btn_fw, "#1b2032", "#26221c", THEME["warning"], "#fde047")
 
-        btn_svc = tk.Button(btn_frame, text="Installa Servizio", bg="#64748b", fg="#ffffff",
-                            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", command=self._open_installer)
-        btn_svc.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=5, padx=(3, 0))
+        btn_svc = tk.Button(btn_row, text="⚙ Installa Servizio", bg="#1b2032", fg=THEME["text_muted"],
+                            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+                            command=self._open_installer)
+        btn_svc.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=6, padx=(4, 0))
+        bind_hover(btn_svc, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
 
     def _open_firewall_unblock(self):
         bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "allow_firewall.bat"))
@@ -242,8 +331,8 @@ class HostControlPanel:
             self.daemon = HostDaemon(broker_url=broker_url)
             self.daemon_thread = threading.Thread(target=self._run_daemon, daemon=True)
             self.daemon_thread.start()
-            self.btn_daemon.config(text="Arresta Demone", bg="#f38ba8")
-            self.lbl_status.config(text="Stato: Demone in esecuzione (Pronto)", fg="#a6e3a1")
+            self.btn_daemon.config(text="Arresta Demone", bg="#ef4444")
+            self.lbl_status.config(text="● Servizio Host Attivo (Pronto all'ascolto)", fg=THEME["success"])
         else:
             self.daemon.stop()
             if self.local_broker:
@@ -252,8 +341,8 @@ class HostControlPanel:
                 except Exception:
                     pass
                 self.local_broker = None
-            self.btn_daemon.config(text="Avvia Demone Manuale", bg="#89b4fa")
-            self.lbl_status.config(text="Stato: Demone arrestato", fg="#f38ba8")
+            self.btn_daemon.config(text="Avvia Demone", bg=THEME["accent"])
+            self.lbl_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
 
     def _run_daemon(self):
         async def runner():
@@ -261,10 +350,9 @@ class HostControlPanel:
                 try:
                     self.local_broker = SignalingBroker(host="0.0.0.0", port=8765)
                     await self.local_broker.start()
-                except Exception as e:
+                except Exception:
                     pass
             await self.daemon.start()
-
         asyncio.run(runner())
 
     def _open_installer(self):
@@ -278,11 +366,11 @@ class HostControlPanel:
         if self.daemon and self.daemon.running:
             clients = len(self.daemon.connected_clients)
             if clients > 0:
-                self.lbl_status.config(text=f"Stato: Connesso ({clients} client attivo/i)", fg="#a6e3a1")
+                self.lbl_status.config(text=f"● Connesso ({clients} client attivo/i)", fg=THEME["success"])
             else:
-                self.lbl_status.config(text="Stato: In ascolto su porta 8765 (Pronto)", fg="#89b4fa")
+                self.lbl_status.config(text="● In ascolto su porta 8765 (Pronto)", fg=THEME["cyan"])
         else:
-            self.lbl_status.config(text="Stato: Demone arrestato", fg="#f38ba8")
+            self.lbl_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
         self.root.after(2000, self._update_status)
 
     def run(self):
