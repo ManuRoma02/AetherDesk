@@ -14,6 +14,12 @@
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License MIT"/>
 </p>
 
+<p align="center">
+  <a href="https://github.com/ManuRoma02/AetherDesk/releases/latest/download/AetherDesk.exe">
+    <img src="https://img.shields.io/badge/Download-AetherDesk.exe%20(v1.2.0)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download AetherDesk.exe"/>
+  </a>
+</p>
+
 ---
 
 ## ⚡ Cos'è AetherDesk?
