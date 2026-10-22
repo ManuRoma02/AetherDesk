@@ -81,3 +81,18 @@ def test_standalone_binary_health_check():
     assert res_help.returncode == 0, f"Binary --help failed: {res_help.stderr}"
     assert "--connect" in res_help.stdout
     assert "ModuleNotFoundError" not in res_help.stderr
+
+def test_select_saved_device_logic():
+    mock_gui = MagicMock()
+    dev = {
+        "id": "123456789",
+        "name": "Office-PC",
+        "password": "secret_pwd",
+        "broker_url": "ws://192.168.1.100:8765"
+    }
+    ClientViewerGUI._select_saved_device(mock_gui, dev)
+    mock_gui.combo_id.set.assert_called_with("123456789")
+    mock_gui.entry_pwd.insert.assert_called_with(0, "secret_pwd")
+    mock_gui.entry_broker.insert.assert_called_with(0, "ws://192.168.1.100:8765")
+    mock_gui._on_status_update.assert_called_once()
+

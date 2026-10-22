@@ -173,6 +173,7 @@ class ClientViewerGUI:
         self.btn_ota = None
         self.git_update_info = None
         self.btn_git_update = None
+        self.btn_header_update = None
 
         # FPS metrics
         self._frame_count = 0
@@ -184,8 +185,8 @@ class ClientViewerGUI:
 
         self._build_login_ui()
 
-        # Check for Git OTA updates automatically in background
-        threading.Thread(target=self._check_git_updates_background, daemon=True).start()
+        # Check for Git OTA updates automatically in background on startup
+        threading.Thread(target=lambda: self._check_git_updates_background(notify_if_none=False, prompt_on_found=True), daemon=True).start()
 
         # Auto-start Host daemon in background so this PC is immediately reachable
         self.root.after(200, self._auto_start_host_daemon)
@@ -292,6 +293,15 @@ class ClientViewerGUI:
                                  font=("Consolas", 8, "bold"), padx=6, pady=1)
         lbl_ver_badge.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.btn_header_update = tk.Button(
+            title_row, text="🔄 Controlla Aggiornamenti", bg="#161b2b", fg=THEME["cyan"],
+            activebackground="#20283e", activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
+            relief="flat", cursor="hand2", padx=8, pady=1, highlightthickness=1,
+            highlightbackground=THEME["card_border"], command=self._on_git_update_click
+        )
+        self.btn_header_update.pack(side=tk.LEFT, padx=(8, 0))
+        bind_hover(self.btn_header_update, "#161b2b", "#20283e", THEME["cyan"], "#ffffff")
+
         lbl_sub = tk.Label(brand_frame, text="Controllo Remoto Ultra-Leggero • Crittografia E2EE",
                            bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 9))
         lbl_sub.pack(anchor="w", pady=(1, 0))
@@ -340,7 +350,7 @@ class ClientViewerGUI:
         lbl_foot_sec.pack(side=tk.LEFT)
 
         self.btn_git_update = tk.Button(
-            footer, text="🔄 Git: Controllo...", bg="#141824", fg=THEME["text_muted"],
+            footer, text="🔄 Controlla Aggiornamenti", bg="#141824", fg=THEME["text_muted"],
             activebackground="#20263a", activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
             relief="flat", cursor="hand2", padx=10, pady=3, highlightthickness=1,
             highlightbackground=THEME["card_border"], command=self._on_git_update_click
@@ -488,9 +498,13 @@ class ClientViewerGUI:
                                    highlightthickness=1, highlightbackground=THEME["card_border"])
             quick_frame.pack(fill=tk.X)
 
-            lbl_q_title = tk.Label(quick_frame, text="●  CONNESSIONE RAPIDA SALVATI", bg=THEME["card"],
-                                  fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
-            lbl_q_title.pack(anchor="w", pady=(0, 8))
+            lbl_q_title = tk.Label(quick_frame, text="●  DISPOSITIVI RECENTI & SALVATI", bg=THEME["card"],
+                                   fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+            lbl_q_title.pack(anchor="w", pady=(0, 3))
+
+            lbl_q_hint = tk.Label(quick_frame, text="Seleziona un dispositivo per compilare automaticamente i campi:",
+                                  bg=THEME["card"], fg=THEME["text_dim"], font=("Segoe UI", 8))
+            lbl_q_hint.pack(anchor="w", pady=(0, 8))
 
             displayed_devices = devices if devices else [{"id": saved_id, "name": "PC Recente", "password": saved_pwd, "broker_url": saved_broker}]
             for dev in displayed_devices[:2]:
@@ -515,12 +529,13 @@ class ClientViewerGUI:
                                  font=("Consolas", 8), anchor="w")
                 lbl_b.pack(anchor="w")
 
-                btn_q = tk.Button(row, text="⚡ Connetti", bg="#064e3b", fg="#6ee7b7",
-                                  activebackground="#059669", activeforeground="#ffffff",
-                                  font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=3,
-                                  command=lambda d=dev: self._quick_connect_to(d))
-                btn_q.pack(side=tk.RIGHT)
-                bind_hover(btn_q, "#064e3b", "#059669", "#6ee7b7", "#ffffff")
+                btn_sel = tk.Button(row, text="Seleziona", bg="#161b2b", fg=THEME["cyan"],
+                                    activebackground="#20283e", activeforeground="#ffffff",
+                                    font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=12, pady=3,
+                                    highlightthickness=1, highlightbackground=THEME["card_border"],
+                                    command=lambda d=dev: self._select_saved_device(d))
+                btn_sel.pack(side=tk.RIGHT)
+                bind_hover(btn_sel, "#161b2b", "#20283e", THEME["cyan"], "#ffffff")
 
     def _render_host_tab(self, parent):
         # Card 1: This Machine ID & Status
@@ -694,14 +709,19 @@ class ClientViewerGUI:
         else:
             messagebox.showerror("Errore", f"File non trovato: {bat_path}")
 
-    def _quick_connect_to(self, dev: dict):
-        self.combo_id.set(dev.get("id", ""))
+    def _select_saved_device(self, dev: dict):
+        d_id = dev.get("id", "")
+        self.combo_id.set(d_id)
         self.entry_pwd.delete(0, tk.END)
         self.entry_pwd.insert(0, dev.get("password", ""))
         if dev.get("broker_url"):
             self.entry_broker.delete(0, tk.END)
             self.entry_broker.insert(0, dev.get("broker_url"))
-        self._start_connect()
+        name = dev.get("name", "Computer")
+        self._on_status_update(f"Selezionato: {name} [{d_id}]. Clicca 'Connetti al Computer' per avviare.")
+
+    def _quick_connect_to(self, dev: dict):
+        self._select_saved_device(dev)
 
     def _toggle_pwd_view(self):
         self.pwd_visible = not self.pwd_visible
@@ -1063,32 +1083,100 @@ class ClientViewerGUI:
         except Exception as e:
             self._on_status_update(f"Errore invio file: {e}")
 
-    def _check_git_updates_background(self, notify_if_none: bool = False):
+    def _safe_after(self, ms: int, func):
         try:
-            is_newer, info = check_github_update()
-            def update_ui():
-                if not self.btn_git_update:
-                    return
-                if is_newer and info.get("download_url"):
-                    self.git_update_info = info
-                    self.btn_git_update.config(
-                        text=f"⚡ Aggiorna Git (v{info['tag']})",
-                        bg="#059669",
-                        fg="#ffffff"
-                    )
-                    self._on_status_update(f"Aggiornamento Git disponibile: v{info['tag']}!")
-                else:
-                    tag = info.get("tag", get_app_version())
-                    self.btn_git_update.config(
-                        text=f"✓ Git v{tag} (Aggiornato)",
-                        bg="#141824",
-                        fg="#34d399"
-                    )
-                    if notify_if_none:
-                        messagebox.showinfo("Aggiornamento Git", f"AetherDesk e' gia' aggiornato all'ultima versione disponibile su Git (v{tag}).")
-            self.root.after(0, update_ui)
+            if hasattr(self, "root") and self.root and self.root.winfo_exists():
+                self.root.after(ms, func)
         except Exception:
             pass
+
+    def _check_git_updates_background(self, notify_if_none: bool = False, prompt_on_found: bool = False):
+        try:
+            def set_checking():
+                if self.btn_header_update:
+                    self.btn_header_update.config(text="🔄 Controllo...", state=tk.DISABLED)
+                if self.btn_git_update:
+                    self.btn_git_update.config(text="🔄 Controllo...", state=tk.DISABLED)
+            self._safe_after(0, set_checking)
+
+            is_newer, info = check_github_update()
+
+            def update_ui():
+                if self.btn_header_update:
+                    self.btn_header_update.config(state=tk.NORMAL)
+                if self.btn_git_update:
+                    self.btn_git_update.config(state=tk.NORMAL)
+
+                if is_newer and info.get("download_url"):
+                    self.git_update_info = info
+                    tag = info.get("tag", "")
+                    if self.btn_header_update:
+                        self.btn_header_update.config(
+                            text=f"⚡ Aggiorna a v{tag}",
+                            bg="#059669",
+                            fg="#ffffff"
+                        )
+                    if self.btn_git_update:
+                        self.btn_git_update.config(
+                            text=f"⚡ Aggiornamento Disponibile (v{tag})",
+                            bg="#059669",
+                            fg="#ffffff"
+                        )
+                    self._on_status_update(f"Aggiornamento disponibile: v{tag}!")
+
+                    if prompt_on_found:
+                        size_mb = info.get("size", 0) / (1024 * 1024)
+                        confirm = messagebox.askyesno(
+                            "Aggiornamento Disponibile",
+                            f"E' disponibile una nuova versione di AetherDesk!\n\n"
+                            f"• Versione Installata: v{get_app_version()}\n"
+                            f"• Nuova Versione: v{tag}\n"
+                            f"• Dimensione: {size_mb:.1f} MB\n\n"
+                            f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
+                        )
+                        if confirm:
+                            self._start_git_download(info["download_url"], tag)
+                else:
+                    tag = info.get("tag", get_app_version())
+                    err = info.get("error")
+                    if err:
+                        if self.btn_header_update:
+                            self.btn_header_update.config(text="🔄 Riprova", bg="#161b2b", fg="#f87171")
+                        if self.btn_git_update:
+                            self.btn_git_update.config(text="🔄 Riprova Aggiornamento", bg="#141824", fg="#f87171")
+                        if notify_if_none:
+                            messagebox.showwarning(
+                                "Controllo Aggiornamenti",
+                                f"Impossibile verificare gli aggiornamenti:\n{err}\n\nVerifica la connessione internet."
+                            )
+                    else:
+                        if self.btn_header_update:
+                            self.btn_header_update.config(
+                                text=f"✓ v{get_app_version()} (Aggiornato)",
+                                bg="#161b2b",
+                                fg="#34d399"
+                            )
+                        if self.btn_git_update:
+                            self.btn_git_update.config(
+                                text=f"✓ v{get_app_version()} (Aggiornato)",
+                                bg="#141824",
+                                fg="#34d399"
+                            )
+                        if notify_if_none:
+                            messagebox.showinfo(
+                                "Aggiornamenti AetherDesk",
+                                f"AetherDesk e' gia' aggiornato all'ultima versione disponibile (v{get_app_version()})."
+                            )
+            self._safe_after(0, update_ui)
+        except Exception as e:
+            def err_ui():
+                if self.btn_header_update:
+                    self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, fg="#f87171")
+                if self.btn_git_update:
+                    self.btn_git_update.config(text="🔄 Riprova Aggiornamento", state=tk.NORMAL, fg="#f87171")
+                if notify_if_none:
+                    messagebox.showwarning("Controllo Aggiornamenti", f"Errore durante la verifica:\n{e}")
+            self._safe_after(0, err_ui)
 
     def _on_git_update_click(self):
         if getattr(self, "ota_downloading", False):
@@ -1097,22 +1185,28 @@ class ClientViewerGUI:
             info = self.git_update_info
             size_mb = info.get("size", 0) / (1024 * 1024)
             confirm = messagebox.askyesno(
-                "Aggiornamento Automatico da Git",
+                "Aggiornamento Disponibile",
                 f"Trovata nuova versione su GitHub:\n\n"
-                f"• Versione: v{info['tag']}\n"
+                f"• Versione Installata: v{get_app_version()}\n"
+                f"• Nuova Versione: v{info['tag']}\n"
                 f"• Dimensione: {size_mb:.1f} MB\n\n"
-                f"Vuoi scaricare l'aggiornamento direttamente da Git ed eseguire il riavvio in-place automatico?"
+                f"Vuoi scaricare l'aggiornamento da GitHub ed eseguire il riavvio in-place automatico?"
             )
             if not confirm:
                 return
             self._start_git_download(info["download_url"], info["tag"])
         else:
-            self.btn_git_update.config(text="🔄 Controllo...")
-            threading.Thread(target=lambda: self._check_git_updates_background(notify_if_none=True), daemon=True).start()
+            threading.Thread(
+                target=lambda: self._check_git_updates_background(notify_if_none=True, prompt_on_found=True),
+                daemon=True
+            ).start()
 
     def _start_git_download(self, download_url: str, target_version: str):
         self.ota_downloading = True
-        self.btn_git_update.config(text="⏳ Scaricamento...", state=tk.DISABLED)
+        if self.btn_header_update:
+            self.btn_header_update.config(text="⏳ Scaricamento...", state=tk.DISABLED)
+        if self.btn_git_update:
+            self.btn_git_update.config(text="⏳ Scaricamento...", state=tk.DISABLED)
 
         def worker():
             def on_progress(rec, tot):
@@ -1120,19 +1214,24 @@ class ClientViewerGUI:
                 mb_rec = rec / (1024 * 1024)
                 mb_tot = tot / (1024 * 1024)
                 def up():
+                    txt = f"⬇ {pct}% ({mb_rec:.1f}/{mb_tot:.1f}MB)"
+                    if self.btn_header_update:
+                        self.btn_header_update.config(text=txt)
                     if self.btn_git_update:
-                        self.btn_git_update.config(text=f"⬇ Git: {pct}% ({mb_rec:.1f}/{mb_tot:.1f}MB)")
+                        self.btn_git_update.config(text=f"⬇ Download: {pct}%")
                     self._on_status_update(f"Download da Git: {pct}%...")
-                self.root.after(0, up)
+                self._safe_after(0, up)
 
             ok, temp_path_or_err = download_github_binary(download_url, progress_callback=on_progress)
             if not ok:
                 self.ota_downloading = False
                 def err():
                     messagebox.showerror("Errore Download Git", temp_path_or_err)
+                    if self.btn_header_update:
+                        self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, bg="#161b2b", fg="#f87171")
                     if self.btn_git_update:
                         self.btn_git_update.config(text="🔄 Riprova Git", state=tk.NORMAL, bg="#141824", fg="#f87171")
-                self.root.after(0, err)
+                self._safe_after(0, err)
                 return
 
             applied, app_msg = apply_in_place_update(temp_path_or_err, target_version=target_version)
@@ -1144,9 +1243,11 @@ class ClientViewerGUI:
                     sys.exit(0)
                 else:
                     messagebox.showerror("Errore Aggiornamento", app_msg)
+                    if self.btn_header_update:
+                        self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL)
                     if self.btn_git_update:
                         self.btn_git_update.config(text="🔄 Riprova Git", state=tk.NORMAL)
-            self.root.after(0, finish)
+            self._safe_after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
