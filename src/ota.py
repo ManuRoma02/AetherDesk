@@ -13,7 +13,7 @@ from typing import Optional, Callable, Tuple
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.3.4"
+CURRENT_VERSION = "1.3.5"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 class OTAUpdateState(str, Enum):
@@ -229,28 +229,36 @@ def apply_in_place_update(
         except Exception:
             pass
 
-        # 3. Direct Watchdog & Purge script:
-        # Launches the new executable. After launch confirmation, it permanently deletes
-        # the old backup file and any other .old remnants so no clutter is left behind.
-        watchdog_content = (
-            "@echo off\r\n"
-            "timeout /t 1 /nobreak >nul\r\n"
-            f'start "" "{current_exe}"\r\n'
-            "timeout /t 2 /nobreak >nul\r\n"
-            f'del /f /q "{old_backup}" >nul 2>&1\r\n'
-            f'del /f /q "{current_exe.parent}\\*.old" >nul 2>&1\r\n'
-            f'del /f /q "{current_exe.parent}\\*.exe.old" >nul 2>&1\r\n'
-            "del /f /q \"%~f0\" >nul 2>&1\r\n"
+        # 3. Direct Silent Watchdog & Purge Process:
+        # Uses hidden PowerShell to wait until the current process exits (releasing all file locks),
+        # launches the new executable, and permanently purges .old and .exe.old backup files.
+        # Zero black CMD windows pop up, perfectly seamless for end users.
+        pid = os.getpid()
+        ps_cmd = (
+            f"try {{ Wait-Process -Id {pid} -Timeout 15 }} catch {{}}; "
+            f"Start-Sleep -Milliseconds 250; "
+            f"Start-Process -FilePath '{current_exe}'; "
+            f"Start-Sleep -Milliseconds 600; "
+            f"Remove-Item -Force -Path '{old_backup}', '{current_exe.parent}\\*.old', '{current_exe.parent}\\*.exe.old', '{current_exe.parent}\\*staging*' -ErrorAction SilentlyContinue"
         )
-        watchdog_bat = current_exe.parent / "ota_watchdog.bat"
-        try:
-            watchdog_bat.write_text(watchdog_content, encoding="utf-8")
-        except Exception:
-            pass
 
-        flags = 0x08000008 if os.name == "nt" else 0
-        cmd = f'cmd.exe /c "{watchdog_bat}"' if watchdog_bat.exists() else f'cmd.exe /c start "" "{current_exe}"'
-        subprocess.Popen(cmd, shell=True, creationflags=flags)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE (No console window)
+        creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
+        except Exception as ex_spawn:
+            logger.warning(f"Failed to spawn silent PowerShell updater, falling back to os.startfile: {ex_spawn}")
+            try:
+                os.startfile(str(current_exe))
+            except Exception:
+                pass
 
         return True, "Aggiornamento completato. Riavvio in corso ed eliminazione della versione precedente..."
     except Exception as e:

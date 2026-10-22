@@ -55,7 +55,7 @@ class BITMAPINFOHEADER(ctypes.Structure):
 class DesktopCapture:
     """High-performance Windows screen capture engine with secure UAC desktop switching."""
 
-    def __init__(self, target_width: int = None, target_height: int = None, quality: int = 75):
+    def __init__(self, target_width: int = None, target_height: int = None, quality: int = 55):
         self.quality = quality
         self.target_width = target_width
         self.target_height = target_height
@@ -83,6 +83,9 @@ class DesktopCapture:
         self._buffer = None
         self._last_thumb = None
         self._last_cursor = (0, 0)
+        self._cached_mon_bounds = None
+        self._cached_virt_bounds = None
+        self._bounds_cache_time = 0.0
 
     def switch_desktop(self) -> bool:
         """Switch current thread desktop to the active input desktop (handles UAC/lockscreen)."""
@@ -146,29 +149,48 @@ class DesktopCapture:
         self.current_monitor_id = monitor_id
         self._last_dims = (0, 0, 0, 0)
         self._last_thumb = None
+        self._cached_mon_bounds = None
+        self._cached_virt_bounds = None
+        self._bounds_cache_time = 0.0
 
     def get_virtual_desktop_bounds(self) -> tuple[int, int, int, int]:
-        """Returns (vx, vy, vw, vh) for virtual desktop spanning all monitors."""
+        """Returns (vx, vy, vw, vh) for virtual desktop spanning all monitors (cached 3s)."""
+        import time
+        now = time.time()
+        if self._cached_virt_bounds and (now - self._bounds_cache_time < 3.0):
+            return self._cached_virt_bounds
         vx = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
         vy = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
         vw = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
         vh = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
         if vw <= 0 or vh <= 0:
             w, h = self.get_screen_resolution()
-            return (0, 0, w, h)
-        return (vx, vy, vw, vh)
+            res = (0, 0, w, h)
+        else:
+            res = (vx, vy, vw, vh)
+        self._cached_virt_bounds = res
+        return res
 
     def get_active_monitor_bounds(self) -> tuple[int, int, int, int]:
-        """Returns (src_x, src_y, src_w, src_h) for currently active monitor."""
+        """Returns (src_x, src_y, src_w, src_h) for currently active monitor (cached 3s)."""
+        import time
+        now = time.time()
+        if self._cached_mon_bounds and (now - self._bounds_cache_time < 3.0):
+            return self._cached_mon_bounds
+        self._bounds_cache_time = now
         mons = self.get_monitors_list()
         for m in mons:
             if m["id"] == self.current_monitor_id:
                 rect = m["rect"]
-                return (rect[0], rect[1], m["width"], m["height"])
+                res = (rect[0], rect[1], m["width"], m["height"])
+                self._cached_mon_bounds = res
+                return res
 
         # Fallback to primary monitor
         w, h = self.get_screen_resolution()
-        return (0, 0, w, h)
+        res = (0, 0, w, h)
+        self._cached_mon_bounds = res
+        return res
 
     def get_screen_resolution(self) -> tuple[int, int]:
         w = self.user32.GetSystemMetrics(0)
@@ -296,7 +318,7 @@ class DesktopCapture:
             self._last_cursor = cur_pos
 
             bio = io.BytesIO()
-            img.convert("RGB").save(bio, format="JPEG", quality=self.quality)
+            img.convert("RGB").save(bio, format="JPEG", quality=self.quality, subsampling=2, optimize=False)
             jpeg_bytes = bio.getvalue()
 
         return (jpeg_bytes, (screen_w, screen_h), cur_pos)

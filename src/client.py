@@ -313,6 +313,11 @@ class RemoteClient:
 
                 if msg_type == "FRAME" and binary and self.state.session_key:
                     try:
+                        # Backpressure / Flow control: send FRAME_ACK immediately to prevent bufferbloat
+                        fid = payload.get("fid", 0)
+                        ack_msg = ProtocolMessage.serialize("FRAME_ACK", {"fid": fid, "target_id": self.state.target_id})
+                        asyncio.create_task(self.websocket.send(ack_msg))
+
                         jpeg_bytes = self.security.decrypt_packet(binary, self.state.session_key)
                         size = (payload.get("w", 1920), payload.get("h", 1080))
                         cur = (payload.get("cx", 0), payload.get("cy", 0))

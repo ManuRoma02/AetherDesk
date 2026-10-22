@@ -47,6 +47,9 @@ class HostDaemon:
         self._sleep_prevented = False
         self.websocket = None
         self._listener_task: Optional[asyncio.Task] = None
+        self._frame_ack_event = asyncio.Event()
+        self._frame_ack_event.set()
+        self._in_flight_frame = False
 
     def prevent_sleep(self, enable: bool = True) -> bool:
         """Prevent Windows from sleeping or turning off the screen while unattended."""
@@ -103,6 +106,11 @@ class HostDaemon:
 
             resp = ProtocolMessage.serialize("AUTH_OK", {"status": "authenticated", "device_id": self.device_id})
             return resp
+
+        elif msg_type == "FRAME_ACK":
+            self._in_flight_frame = False
+            self._frame_ack_event.set()
+            return None
 
         elif msg_type == "INPUT":
             key = session_state.get("session_key")
@@ -212,17 +220,13 @@ class HostDaemon:
             if nx is not None and ny is not None:
                 self.input_handler.move_mouse(nx, ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
             self.input_handler.mouse_down(btn)
-            time.sleep(0.015)
             self.input_handler.mouse_up(btn)
         elif action == "mouse_double_click":
             if nx is not None and ny is not None:
                 self.input_handler.move_mouse(nx, ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
             self.input_handler.mouse_down(btn)
-            time.sleep(0.01)
             self.input_handler.mouse_up(btn)
-            time.sleep(0.04)
             self.input_handler.mouse_down(btn)
-            time.sleep(0.01)
             self.input_handler.mouse_up(btn)
         elif action == "mouse_wheel":
             self.input_handler.mouse_wheel(cmd.get("delta", 0), norm_x=nx, norm_y=ny,
@@ -237,14 +241,17 @@ class HostDaemon:
             self.input_handler.send_special(cmd.get("command", ""))
 
     async def run_capture_stream(self, websocket, session_key: bytes):
-        """Streaming loop: captures screen and sends encrypted JPEG frames with change detection."""
+        """Streaming loop: captures screen and sends encrypted JPEG frames with change detection and flow control."""
         if not self.capture:
-            self.capture = DesktopCapture(quality=70)
+            self.capture = DesktopCapture(quality=55)
         else:
             self.capture._last_thumb = None
 
-        target_interval = 1.0 / 30.0 # 30 FPS
+        target_interval = 1.0 / 30.0 # 30 FPS target
         frame_counter = 0
+        self._in_flight_frame = False
+        self._frame_ack_event.set()
+
         while self.running:
             # Check connection state across modern websockets versions
             ws_state = getattr(websocket, "state", None)
@@ -252,6 +259,16 @@ class HostDaemon:
                 break
             if ws_state is None and not getattr(websocket, "open", True):
                 break
+
+            # Backpressure / Flow control: wait for client to finish processing previous frame
+            # This completely eliminates WebSocket bufferbloat and multi-second cursor lag!
+            if self._in_flight_frame:
+                try:
+                    await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.06)
+                except asyncio.TimeoutError:
+                    pass
+                self._in_flight_frame = False
+                self._frame_ack_event.clear()
 
             start_t = time.time()
             try:
@@ -268,8 +285,10 @@ class HostDaemon:
                 jpeg_bytes, size, cur = self.capture.capture_frame(only_if_changed=(not force_keyframe))
                 if jpeg_bytes:
                     encrypted = self.security.encrypt_packet(jpeg_bytes, session_key)
-                    meta = {"w": size[0], "h": size[1], "cx": cur[0], "cy": cur[1]}
+                    meta = {"w": size[0], "h": size[1], "cx": cur[0], "cy": cur[1], "fid": frame_counter}
                     msg = ProtocolMessage.serialize("FRAME", meta, binary_data=encrypted)
+                    self._in_flight_frame = True
+                    self._frame_ack_event.clear()
                     await websocket.send(msg)
             except Exception as e:
                 logger.error(f"Capture error: {e}")

@@ -86,3 +86,24 @@ def test_file_transfer_prepare_file_info(tmp_path):
     assert info["filename"] == "big_sample.bin"
     assert info["filesize"] == 1024
     assert len(info["file_id"]) == 16
+
+def test_host_daemon_frame_ack_backpressure(tmp_path):
+    daemon = HostDaemon(config_dir=str(tmp_path), headless=True)
+    daemon._in_flight_frame = True
+    daemon._frame_ack_event.clear()
+
+    # Client sends back FRAME_ACK
+    daemon.handle_client_message("FRAME_ACK", {"fid": 42}, None, {})
+    assert daemon._in_flight_frame is False
+    assert daemon._frame_ack_event.is_set() is True
+
+def test_desktop_capture_cached_bounds():
+    from src.capture import DesktopCapture
+    cap = DesktopCapture()
+    b1 = cap.get_active_monitor_bounds()
+    b2 = cap.get_active_monitor_bounds()
+    assert b1 == b2
+    v1 = cap.get_virtual_desktop_bounds()
+    v2 = cap.get_virtual_desktop_bounds()
+    assert v1 == v2
+    cap.close()

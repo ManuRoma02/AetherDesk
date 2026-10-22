@@ -1238,7 +1238,11 @@ class ClientViewerGUI:
             self.ota_downloading = False
             def finish():
                 if applied:
-                    messagebox.showinfo("Aggiornamento Riuscito", f"{app_msg}\nAetherDesk verra' riavviato con la nuova versione.")
+                    if self.viewer_window:
+                        try:
+                            self.viewer_window.destroy()
+                        except Exception:
+                            pass
                     self.root.destroy()
                     sys.exit(0)
                 else:
@@ -1292,7 +1296,6 @@ class ClientViewerGUI:
         self.ota_downloading = False
         def notify():
             if success:
-                messagebox.showinfo("Aggiornamento Riuscito", f"{msg}\nL'applicazione si riavviera' adesso.")
                 if self.viewer_window:
                     try:
                         self.viewer_window.destroy()
@@ -1304,7 +1307,7 @@ class ClientViewerGUI:
                 messagebox.showerror("Errore Aggiornamento OTA", f"Impossibile completare l'aggiornamento:\n{msg}")
                 if self.btn_ota:
                     self.btn_ota.config(text="🔄 Aggiorna OTA", state=tk.NORMAL, bg="#064e3b", fg="#6ee7b7")
-        self.root.after(0, notify)
+        self._safe_after(0, notify)
 
     def _sync_clipboard_loop(self):
         if self.viewer_window and self.client.state.is_connected:
@@ -1363,7 +1366,7 @@ class ClientViewerGUI:
 
             img = Image.open(io.BytesIO(jpeg_bytes))
             if getattr(self, "scale_mode", "fit") == "fit":
-                img.thumbnail((c_w, c_h), Image.Resampling.LANCZOS)
+                img.thumbnail((c_w, c_h), Image.Resampling.BILINEAR)
             self.current_img_dims = img.size
             photo = ImageTk.PhotoImage(img)
             self.photo_img = photo
@@ -1395,10 +1398,32 @@ class ClientViewerGUI:
 
     def _on_mouse_move(self, event):
         nx, ny = self._calc_norm_coords(event)
+        now = time.time()
+        # High-performance rate limiting (50 Hz / 20ms) to eliminate WebSocket buffer saturation
+        if now - getattr(self, "_last_mouse_send_time", 0.0) < 0.020:
+            self._pending_mouse_coords = (nx, ny)
+            if not getattr(self, "_mouse_timer_scheduled", False):
+                self._mouse_timer_scheduled = True
+                self._safe_after(20, self._flush_pending_mouse)
+            return
+
+        self._last_mouse_send_time = now
+        self._pending_mouse_coords = None
         asyncio.run_coroutine_threadsafe(
             self.client.send_input({"type": "mouse_move", "x": nx, "y": ny}),
             self.loop
         )
+
+    def _flush_pending_mouse(self):
+        self._mouse_timer_scheduled = False
+        coords = getattr(self, "_pending_mouse_coords", None)
+        if coords and self.client and self.client.state.is_connected:
+            self._last_mouse_send_time = time.time()
+            self._pending_mouse_coords = None
+            asyncio.run_coroutine_threadsafe(
+                self.client.send_input({"type": "mouse_move", "x": coords[0], "y": coords[1]}),
+                self.loop
+            )
 
     def _on_mouse_btn(self, event, button: str, action: str):
         if self.viewer_window:
@@ -1406,6 +1431,7 @@ class ClientViewerGUI:
                 self.viewer_window.focus_force()
             except Exception:
                 pass
+        self._pending_mouse_coords = None
         nx, ny = self._calc_norm_coords(event)
         cmd = {
             "type": f"mouse_{action}",
