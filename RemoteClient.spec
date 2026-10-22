@@ -9,7 +9,7 @@ a = Analysis(
         'PIL', 'PIL.Image', 'PIL.ImageTk', 'defusedxml', 'xml.etree.ElementTree',
         'cryptography', 'websockets', 'win32clipboard', 'src.ota',
         'src.host_tray', 'src.host_daemon', 'src.signaling_broker', 'src.capture',
-        'src.input_handler', 'src.security', 'src.transfer', 'src.protocol', 'src.client'
+        'src.input_handler', 'src.security', 'src.transfer', 'src.protocol', 'src.client', 'src.discovery'
     ],
     hookspath=[],
     hooksconfig={},

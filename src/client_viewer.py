@@ -187,9 +187,44 @@ class ClientViewerGUI:
         # Check for Git OTA updates automatically in background
         threading.Thread(target=self._check_git_updates_background, daemon=True).start()
 
+        # Auto-start Host daemon in background so this PC is immediately reachable
+        self.root.after(200, self._auto_start_host_daemon)
+
+        # Start polling for discovered LAN peers
+        self.root.after(1500, self._poll_discovered_lan_peers)
+
         # Failsafe Boot Confirmation
         if check_boot_state() == OTAUpdateState.TESTING:
             self.root.after(2500, self._verify_and_confirm_ota_boot)
+
+    def _auto_start_host_daemon(self):
+        try:
+            if not self.host_daemon or not self.host_daemon.running:
+                self._toggle_host_daemon()
+        except Exception as e:
+            pass
+
+    def _poll_discovered_lan_peers(self):
+        try:
+            from src.discovery import get_discovery_listener
+            listener = get_discovery_listener()
+            peers = listener.get_discovered_peers()
+            if peers and hasattr(self, "combo_id"):
+                saved_devices = self.settings.get_devices() if hasattr(self, "settings") else []
+                current_val = self.combo_id.get()
+                options = []
+                for p in peers:
+                    options.append(f"{p['device_id']} (🌐 {p['name']} - {p['ip']})")
+                for d in saved_devices:
+                    opt = f"{d['id']} ({d.get('name', 'PC')})"
+                    if opt not in options:
+                        options.append(opt)
+                if options:
+                    self.combo_id["values"] = options
+        except Exception:
+            pass
+        if self.root:
+            self.root.after(3000, self._poll_discovered_lan_peers)
 
     def _verify_and_confirm_ota_boot(self):
         try:
@@ -691,6 +726,15 @@ class ClientViewerGUI:
     def _on_device_selected(self, event=None):
         selected = self.combo_id.get().strip()
         clean_id = re.sub(r"\s+", "", selected.split("(")[0]) if "(" in selected else re.sub(r"\s+", "", selected)
+
+        # Auto-extract IP if chosen from LAN discovery (e.g. "... - 192.168.1.50)")
+        if "(" in selected and "-" in selected:
+            ip_match = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", selected)
+            if ip_match:
+                lan_ip = ip_match.group(1)
+                self.entry_broker.delete(0, tk.END)
+                self.entry_broker.insert(0, f"ws://{lan_ip}:8765")
+
         devices = self.settings.get_devices()
         for d in devices:
             if re.sub(r"\s+", "", d.get("id", "")) == clean_id:
@@ -713,11 +757,22 @@ class ClientViewerGUI:
         dev_id = raw_val.split("(")[0].strip() if "(" in raw_val else raw_val
         pwd = self.entry_pwd.get().strip()
         broker_url = self.entry_broker.get().strip()
+
+        # Direct IP support: if user entered an IP address in the ID field
+        if ClientState.is_ip_or_host(dev_id):
+            if not broker_url or "127.0.0.1" in broker_url or "localhost" in broker_url:
+                target_host = dev_id if dev_id.startswith("ws://") else f"ws://{dev_id}"
+                if ":" not in target_host.split("://")[1]:
+                    target_host = f"{target_host}:8765"
+                broker_url = target_host
+                self.entry_broker.delete(0, tk.END)
+                self.entry_broker.insert(0, broker_url)
+
         if not broker_url:
             broker_url = "ws://127.0.0.1:8765"
 
         if not ClientState.validate_id(dev_id):
-            messagebox.showerror("Errore ID", "L'ID deve essere composto esattamente da 9 cifre (es. 482 910 234).")
+            messagebox.showerror("Errore ID", "Inserisci un ID di 9 cifre (es. 482 910 234) oppure l'indirizzo IP del computer.")
             return
 
         self.btn_connect.config(state="disabled", text="⏳  Connessione in corso...", bg="#0369a1")

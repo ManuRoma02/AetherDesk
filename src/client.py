@@ -131,9 +131,20 @@ class ClientState:
         return re.sub(r"\s+", "", device_id.strip())
 
     @staticmethod
+    def is_ip_or_host(val: str) -> bool:
+        clean = val.strip()
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?$", clean):
+            return True
+        if clean.lower() in ("localhost", "127.0.0.1") or clean.lower().startswith("127.0.0.1:"):
+            return True
+        return False
+
+    @staticmethod
     def validate_id(device_id: str) -> bool:
         cleaned = ClientState.clean_id(device_id)
-        return len(cleaned) == 9 and cleaned.isdigit()
+        if len(cleaned) == 9 and cleaned.isdigit():
+            return True
+        return ClientState.is_ip_or_host(device_id)
 
     def set_connecting(self, connecting: bool):
         self.is_connecting = connecting
@@ -182,17 +193,43 @@ class RemoteClient:
 
     async def connect(self, device_id: str, password: str, broker_url: Optional[str] = None) -> bool:
         """Perform handshake and authenticate with remote host."""
-        if broker_url:
-            self.broker_url = broker_url.strip()
+        clean_id = ClientState.clean_id(device_id)
+
+        # 0a. Check if direct IP was entered as device_id
+        if ClientState.is_ip_or_host(device_id):
+            ip_candidate = clean_id
+            if not broker_url or "127.0.0.1" in broker_url or "localhost" in broker_url:
+                target_url = ip_candidate if ip_candidate.startswith("ws://") else f"ws://{ip_candidate}"
+                if ":" not in target_url.split("://")[1]:
+                    target_url = f"{target_url}:8765"
+                self.broker_url = target_url
+        elif broker_url:
+            clean_brk = broker_url.strip()
+            if not clean_brk.startswith("ws://") and not clean_brk.startswith("wss://"):
+                clean_brk = f"ws://{clean_brk}"
+            host_part = clean_brk.split("://", 1)[1]
+            if ":" not in host_part.split("/", 1)[0]:
+                clean_brk = f"{clean_brk}:8765"
+            self.broker_url = clean_brk
+
+        # 0b. Auto-resolve peer broker via LAN Discovery if still on default localhost
+        if not broker_url or "127.0.0.1" in self.broker_url or "localhost" in self.broker_url:
+            try:
+                from src.discovery import get_discovery_listener
+                lan_broker = get_discovery_listener().get_peer_broker_url(clean_id)
+                if lan_broker:
+                    logger.info(f"Auto-resolved peer {clean_id} on LAN via UDP Discovery at {lan_broker}")
+                    self.broker_url = lan_broker
+            except Exception as e:
+                logger.debug(f"LAN discovery lookup skipped: {e}")
 
         if not ClientState.validate_id(device_id):
-            self._set_status("ID non valido. Inserire 9 cifre.")
+            self._set_status("ID non valido. Inserire 9 cifre o IP computer.")
             return False
 
         self.last_dev_id = device_id
         self.last_password = password
         self.auto_reconnect = True
-        clean_id = ClientState.clean_id(device_id)
         self.state.set_connecting(True)
         self._set_status(f"Connessione a {self.broker_url}...")
 
@@ -216,7 +253,7 @@ class RemoteClient:
 
             if msg_type == "HOST_NOT_FOUND":
                 self.state.set_connecting(False)
-                self._set_status(f"Dispositivo {clean_id} non trovato o offline.")
+                self._set_status(f"Dispositivo {clean_id} non trovato o offline su {self.broker_url}.")
                 await self.websocket.close()
                 return False
 
@@ -240,7 +277,10 @@ class RemoteClient:
         except asyncio.TimeoutError:
             logger.error("Connection timed out")
             self.state.set_connecting(False)
-            self._set_status(f"Timeout: Server {self.broker_url} non risponde. Verifica che l'host sia avviato e la porta 8765 aperta nel Firewall.")
+            self._set_status(
+                f"Timeout: {self.broker_url} non risponde.\n"
+                f"Verifica che AetherDesk sia aperto sull'host e la porta 8765 non sia bloccata dal Firewall."
+            )
             if self.websocket:
                 try:
                     await self.websocket.close()
@@ -250,7 +290,10 @@ class RemoteClient:
         except (OSError, websockets.exceptions.WebSocketException) as e:
             logger.error(f"Connection failed: {e}")
             self.state.set_connecting(False)
-            self._set_status(f"Server non raggiungibile ({self.broker_url}). Verifica che il server sia attivo e la porta 8765 aperta.")
+            self._set_status(
+                f"Host non raggiungibile ({self.broker_url}).\n"
+                f"Verifica che l'applicazione sia aperta e l'IP corretto."
+            )
             if self.websocket:
                 await self.websocket.close()
         except Exception as e:

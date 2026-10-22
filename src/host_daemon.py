@@ -366,6 +366,15 @@ class HostDaemon:
         self.running = True
         self.prevent_sleep(True)
         logger.info(f"Host Daemon started for Device ID: {self.device_id}")
+
+        # Start LAN UDP discovery beacon so clients on same Wi-Fi/LAN find this host automatically
+        try:
+            from src.discovery import LANBeaconBroadcaster
+            self._broadcaster = LANBeaconBroadcaster(self.device_id)
+            self._broadcaster.start()
+        except Exception as e:
+            logger.debug(f"Discovery broadcaster skipped: {e}")
+
         self._listener_task = asyncio.create_task(self._broker_listener())
         try:
             await self._listener_task
@@ -375,6 +384,12 @@ class HostDaemon:
     def stop(self):
         self.running = False
         self.prevent_sleep(False)
+        if hasattr(self, "_broadcaster") and self._broadcaster:
+            try:
+                self._broadcaster.stop()
+            except Exception:
+                pass
+            self._broadcaster = None
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
         if self.capture:
