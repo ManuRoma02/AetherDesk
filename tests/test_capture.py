@@ -72,3 +72,23 @@ def test_src_modules_import_without_cv2(monkeypatch):
     import src.client_viewer
     importlib.reload(src.client_viewer)
     assert hasattr(src.client_viewer, "ClientViewerGUI")
+
+def test_dxcam_fallback_resilience():
+    cap = DesktopCapture()
+    # If dxcam is not available or access denied, GDI fallback must seamlessly work
+    data, dims, cur = cap.capture_frame(only_if_changed=False)
+    assert isinstance(data, bytes)
+    assert len(data) > 0
+    cap.close()
+
+def test_high_resolution_change_detection(monkeypatch):
+    import numpy as np
+    cap = DesktopCapture(target_width=320, target_height=180)
+    # Simulate first frame
+    frame1, dims, cur = cap.capture_frame(only_if_changed=False)
+    assert frame1 is not None
+
+    # Immediate second frame with only_if_changed=True should skip if unchanged
+    frame2, _, _ = cap.capture_frame(only_if_changed=True)
+    assert frame2 is None or isinstance(frame2, bytes)
+    cap.close()

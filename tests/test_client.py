@@ -41,10 +41,14 @@ def test_lan_discovery_beacon_and_peer_resolution():
     try:
         broadcaster = LANBeaconBroadcaster(device_id="888 777 666", port=8765)
         broadcaster.start()
-        time.sleep(1.2)
+        url = None
+        for _ in range(30):
+            url = listener.get_peer_broker_url("888777666")
+            if url:
+                break
+            time.sleep(0.1)
         broadcaster.stop()
 
-        url = listener.get_peer_broker_url("888777666")
         assert url is not None
         assert ":8765" in url
     finally:

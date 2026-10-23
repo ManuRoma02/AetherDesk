@@ -13,6 +13,13 @@ except ImportError:
     np = None
     HAS_CV2 = False
 
+try:
+    import dxcam
+    HAS_DXCAM = True
+except Exception:
+    dxcam = None
+    HAS_DXCAM = False
+
 # Win32 Constants
 DESKTOP_READOBJECTS = 0x0001
 DESKTOP_WRITEOBJECTS = 0x0080
@@ -87,6 +94,20 @@ class DesktopCapture:
         self._cached_virt_bounds = None
         self._bounds_cache_time = 0.0
 
+        self._dxcam = None
+        self._init_dxcam()
+
+    def _init_dxcam(self):
+        """Try initializing DXGI Desktop Duplication engine via DXcam."""
+        if not HAS_DXCAM:
+            self._dxcam = None
+            return
+        try:
+            out_idx = max(0, self.current_monitor_id)
+            self._dxcam = dxcam.create(output_idx=out_idx)
+        except Exception:
+            self._dxcam = None
+
     def switch_desktop(self) -> bool:
         """Switch current thread desktop to the active input desktop (handles UAC/lockscreen)."""
         flags = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP
@@ -152,6 +173,13 @@ class DesktopCapture:
         self._cached_mon_bounds = None
         self._cached_virt_bounds = None
         self._bounds_cache_time = 0.0
+        if self._dxcam:
+            try:
+                self._dxcam.release()
+            except Exception:
+                pass
+            self._dxcam = None
+        self._init_dxcam()
 
     def get_virtual_desktop_bounds(self) -> tuple[int, int, int, int]:
         """Returns (vx, vy, vw, vh) for virtual desktop spanning all monitors (cached 3s)."""
@@ -207,11 +235,50 @@ class DesktopCapture:
         """Capture the current frame, encode as JPEG, and return (jpeg_bytes, (screen_w, screen_h), (cur_x, cur_y))."""
         src_x, src_y, screen_w, screen_h = self.get_active_monitor_bounds()
         cur_x, cur_y = self.get_cursor_position()
+        cur_pos = (cur_x, cur_y)
 
         out_w = self.target_width if self.target_width else screen_w
         out_h = self.target_height if self.target_height else screen_h
 
-        # Recreate DCs/Bitmaps if dimensions change
+        # 1. High-Performance DXcam (Desktop Duplication) path
+        if self._dxcam is not None and HAS_CV2 and cv2 is not None and np is not None:
+            try:
+                frame = self._dxcam.grab()
+                # If frame is None and only_if_changed requested, DXGI indicates compositor has no dirty rects
+                if frame is None and only_if_changed and cur_pos == self._last_cursor and self._last_thumb is not None:
+                    return (None, (screen_w, screen_h), cur_pos)
+
+                if frame is not None:
+                    if frame.shape[2] == 4:
+                        bgr = frame[:, :, :3]
+                    else:
+                        bgr = frame
+
+                    if (out_w, out_h) != (bgr.shape[1], bgr.shape[0]):
+                        bgr = cv2.resize(bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+                    # High-fidelity change detection (160x90 INTER_AREA)
+                    thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+                    if only_if_changed and self._last_thumb is not None:
+                        is_same = False
+                        if isinstance(self._last_thumb, np.ndarray):
+                            diff = cv2.absdiff(thumb, self._last_thumb)
+                            is_same = bool(np.max(diff) < 2)
+                        if cur_pos == self._last_cursor and is_same:
+                            return (None, (screen_w, screen_h), cur_pos)
+
+                    self._last_thumb = thumb
+                    self._last_cursor = cur_pos
+
+                    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+                    success, enc = cv2.imencode('.jpg', bgr, encode_params)
+                    jpeg_bytes = enc.tobytes() if success else b""
+                    return (jpeg_bytes, (screen_w, screen_h), cur_pos)
+            except Exception:
+                # Graceful fallback to GDI if DXGI surface becomes invalid
+                self._dxcam = None
+
+        # 2. GDI Fallback Path
         dims = (screen_w, screen_h, out_w, out_h)
         if dims != self._last_dims:
             self._cleanup_gdi()
@@ -231,7 +298,6 @@ class DesktopCapture:
         )
 
         if not blt_res:
-            # Try switching desktop and retry
             self.switch_desktop()
             self._cleanup_gdi()
             self._src_dc = self.user32.GetDC(0)
@@ -250,7 +316,6 @@ class DesktopCapture:
             ci = CURSORINFO()
             ci.cbSize = ctypes.sizeof(CURSORINFO)
             if self.user32.GetCursorInfo(ctypes.byref(ci)) and (ci.flags & 1):
-                # Scale cursor position relative to current monitor bounds
                 rel_cur_x = ci.ptScreenPos.x - src_x
                 rel_cur_y = ci.ptScreenPos.y - src_y
                 scaled_cur_x = int(rel_cur_x * (out_w / screen_w))
@@ -281,11 +346,12 @@ class DesktopCapture:
             arr = np.frombuffer(self._buffer, dtype=np.uint8).reshape((out_h, out_w, 4))
             bgr = arr[:, :, :3]
 
-            thumb = cv2.resize(bgr, (32, 18), interpolation=cv2.INTER_NEAREST)
+            thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
             if only_if_changed and self._last_thumb is not None:
                 is_same_thumb = False
                 if isinstance(self._last_thumb, np.ndarray):
-                    is_same_thumb = np.array_equal(thumb, self._last_thumb)
+                    diff = cv2.absdiff(thumb, self._last_thumb)
+                    is_same_thumb = bool(np.max(diff) < 2)
                 elif isinstance(self._last_thumb, bytes):
                     is_same_thumb = (thumb.tobytes() == self._last_thumb)
 
@@ -301,7 +367,7 @@ class DesktopCapture:
         else:
             # Native Pillow fallback (zero C-extension dependency, bundled in standalone binary)
             img = Image.frombuffer("RGBA", (out_w, out_h), self._buffer, "raw", "BGRA", 0, 1)
-            thumb = img.resize((32, 18), Image.Resampling.NEAREST)
+            thumb = img.resize((160, 90), Image.Resampling.BILINEAR)
             thumb_bytes = thumb.tobytes()
 
             if only_if_changed and self._last_thumb is not None:
@@ -336,6 +402,12 @@ class DesktopCapture:
 
     def close(self):
         self._cleanup_gdi()
+        if self._dxcam:
+            try:
+                self._dxcam.release()
+            except Exception:
+                pass
+            self._dxcam = None
         if self.current_desktop:
             try:
                 self.user32.CloseDesktop(self.current_desktop)

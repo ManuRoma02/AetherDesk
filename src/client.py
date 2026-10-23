@@ -1,4 +1,5 @@
 import re
+import time
 import json
 import secrets
 import asyncio
@@ -177,6 +178,7 @@ class RemoteClient:
         self.on_ota_info_callback: Optional[Callable[[dict], None]] = None
         self.on_ota_progress_callback: Optional[Callable[[int, int], None]] = None
         self.on_ota_complete_callback: Optional[Callable[[bool, str], None]] = None
+        self.on_monitors_callback: Optional[Callable[[list], None]] = None
         self._ota_file_size = 0
         self._ota_sha256 = ""
         self._ota_received_bytes = 0
@@ -264,6 +266,32 @@ class RemoteClient:
                 host_salt = bytes.fromhex(host_salt_hex) if host_salt_hex else b""
                 master_key = self.security.derive_master_key(password, host_salt) if host_salt else password.encode("utf-8")
                 session_key = self.security.derive_session_key(master_key, salt)
+
+                # Send authentication challenge token
+                auth_token = self.security.encrypt_packet(b"AETHER_AUTH_V1", session_key)
+                auth_req = ProtocolMessage.serialize("AUTH_REQUEST", {"salt": salt.hex(), "target_id": clean_id}, binary_data=auth_token)
+                await self.websocket.send(auth_req)
+
+                # Validate host response or immediate first frame
+                try:
+                    auth_resp_raw = await asyncio.wait_for(self.websocket.recv(), timeout=3.5)
+                    auth_type, auth_payload, auth_bin = ProtocolMessage.deserialize(auth_resp_raw)
+                    if auth_type == "AUTH_FAILED":
+                        self.state.set_connecting(False)
+                        self._set_status("Password errata. Impossibile accedere all'host remoto.")
+                        await self.websocket.close()
+                        return False
+                    elif auth_type == "FRAME" and auth_bin:
+                        try:
+                            first_jpeg = self.security.decrypt_packet(auth_bin, session_key)
+                        except Exception:
+                            self.state.set_connecting(False)
+                            self._set_status("Password errata. Flusso non decifrabile.")
+                            await self.websocket.close()
+                            return False
+                except asyncio.TimeoutError:
+                    pass
+
                 self.state.set_connected(True, session_key)
                 self.state.target_id = clean_id
                 self._set_status("Connesso con successo!")
@@ -272,6 +300,8 @@ class RemoteClient:
                 asyncio.create_task(self._receive_loop())
                 # Query host for OTA update availability
                 asyncio.create_task(self.check_ota_update())
+                # Request list of available physical monitors on remote host
+                asyncio.create_task(self.request_monitors_list())
                 return True
 
         except asyncio.TimeoutError:
@@ -313,19 +343,44 @@ class RemoteClient:
 
                 if msg_type == "FRAME" and binary and self.state.session_key:
                     try:
+                        t_recv = time.time()
                         # Backpressure / Flow control: send FRAME_ACK immediately to prevent bufferbloat
                         fid = payload.get("fid", 0)
                         ack_msg = ProtocolMessage.serialize("FRAME_ACK", {"fid": fid, "target_id": self.state.target_id})
                         asyncio.create_task(self.websocket.send(ack_msg))
 
+                        t_dec_start = time.perf_counter_ns()
                         jpeg_bytes = self.security.decrypt_packet(binary, self.state.session_key)
+                        t_dec_ms = round((time.perf_counter_ns() - t_dec_start) / 1e6, 2)
+
                         size = (payload.get("w", 1920), payload.get("h", 1080))
                         cur = (payload.get("cx", 0), payload.get("cy", 0))
                         self.state.host_dims = size
+
+                        telemetry = {
+                            "fid": fid,
+                            "t_send": payload.get("t_send", 0.0),
+                            "t_recv": t_recv,
+                            "cap_ms": payload.get("cap_ms", 0.0),
+                            "enc_ms": payload.get("enc_ms", 0.0),
+                            "dec_ms": t_dec_ms,
+                            "size_bytes": len(binary)
+                        }
+
                         if self.on_frame_callback:
-                            self.on_frame_callback(jpeg_bytes, size, cur)
+                            try:
+                                self.on_frame_callback(jpeg_bytes, size, cur, telemetry)
+                            except TypeError:
+                                self.on_frame_callback(jpeg_bytes, size, cur)
+                        self._decrypt_failures = 0
                     except Exception as e:
                         logger.error(f"Frame decrypt error: {e}")
+                        self._decrypt_failures = getattr(self, "_decrypt_failures", 0) + 1
+                        if self._decrypt_failures >= 3:
+                            self._set_status("Password errata o chiave di sessione non valida.")
+                            if self.on_status_callback:
+                                self.on_status_callback("Password errata. Impossibile decifrare il video.")
+                            asyncio.create_task(self.disconnect())
 
                 elif msg_type == "CLIPBOARD" and binary and self.state.session_key:
                     try:
@@ -341,6 +396,12 @@ class RemoteClient:
                     saved_path = payload.get("saved_path", "")
                     if self.on_file_saved_callback:
                         self.on_file_saved_callback(saved_path)
+
+                elif msg_type == "MONITORS_LIST":
+                    mons = payload.get("monitors", [])
+                    self.state.monitors = mons
+                    if self.on_monitors_callback:
+                        self.on_monitors_callback(mons)
 
                 elif msg_type == "OTA_INFO":
                     if self.on_ota_info_callback:
@@ -451,6 +512,13 @@ class RemoteClient:
         if not self.state.is_connected or not self.websocket:
             return
         msg = ProtocolMessage.serialize("SWITCH_MONITOR", {"target_id": self.state.target_id, "monitor_id": monitor_id})
+        await self.websocket.send(msg)
+
+    async def request_monitors_list(self):
+        """Ask host for list of connected physical display monitors."""
+        if not self.state.is_connected or not self.websocket:
+            return
+        msg = ProtocolMessage.serialize("GET_MONITORS", {"target_id": self.state.target_id})
         await self.websocket.send(msg)
 
     async def set_quality(self, quality: int):

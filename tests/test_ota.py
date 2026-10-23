@@ -86,6 +86,15 @@ def test_file_validation_and_sha256(tmp_path):
     sha = compute_file_sha256(fake_good)
     assert len(sha) == 64
 
+    # Valid checksum verification
+    valid_sha, _ = validate_executable_file(fake_good, expected_sha256=sha)
+    assert valid_sha is True
+
+    # Bad checksum rejection
+    invalid_sha, err = validate_executable_file(fake_good, expected_sha256="0" * 64)
+    assert invalid_sha is False
+    assert "Verifica integrita' SHA-256 fallita" in err
+
 def test_daemon_ota_check_handler(tmp_path):
     daemon = HostDaemon(config_dir=str(tmp_path), headless=True)
     resp = daemon.handle_client_message("OTA_CHECK", {}, None, {})

@@ -79,10 +79,11 @@ def get_host_dist_executable() -> Optional[Path]:
             return p
     return None
 
-def validate_executable_file(filepath: str | Path) -> Tuple[bool, str]:
+def validate_executable_file(filepath: str | Path, expected_sha256: Optional[str] = None) -> Tuple[bool, str]:
     """
-    Verify integrity and format of binary before staging/flashing.
-    Ensures minimum size (>1MB) and valid Windows PE header (MZ magic).
+    Verify integrity, format and cryptographic digest of binary before staging/flashing.
+    Ensures minimum size (>1MB), valid Windows PE header (MZ magic),
+    and exact SHA-256 hash match against verified manifest.
     """
     p = Path(filepath)
     if not p.exists() or not p.is_file():
@@ -96,6 +97,13 @@ def validate_executable_file(filepath: str | Path) -> Tuple[bool, str]:
                 return False, "Intestazione binaria non valida (manca magic header MZ/PE)."
     except Exception as e:
         return False, f"Impossibile verificare l'integrita' del file: {e}"
+
+    if expected_sha256:
+        actual_sha = compute_file_sha256(p).lower().strip()
+        expected = expected_sha256.lower().strip()
+        if actual_sha != expected:
+            return False, f"Verifica integrita' SHA-256 fallita: atteso {expected[:16]}..., calcolato {actual_sha[:16]}..."
+
     return True, "Eseguibile valido."
 
 def verify_update_manifest(
@@ -178,7 +186,8 @@ def apply_in_place_update(
     downloaded_temp_path: str,
     target_version: Optional[str] = None,
     allow_downgrade: bool = False,
-    destination_path: Optional[str | Path] = None
+    destination_path: Optional[str | Path] = None,
+    expected_sha256: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
     Replace running executable following Dual-Bank / A-B Staging architecture
@@ -186,7 +195,7 @@ def apply_in_place_update(
     """
     try:
         temp_p = Path(downloaded_temp_path)
-        valid, msg = validate_executable_file(temp_p)
+        valid, msg = validate_executable_file(temp_p, expected_sha256=expected_sha256)
         if not valid:
             return False, msg
 
@@ -312,10 +321,11 @@ def check_github_update(
 
 def download_github_binary(
     download_url: str,
-    progress_callback: Optional[Callable[[int, int], None]] = None
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    expected_sha256: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
-    Stream download new executable from GitHub with progress callback and validation.
+    Stream download new executable from GitHub with progress callback and cryptographic validation.
     """
     try:
         req = urllib.request.Request(
@@ -335,7 +345,7 @@ def download_github_binary(
                 if progress_callback:
                     progress_callback(received, total_size)
 
-        valid, msg = validate_executable_file(temp_path)
+        valid, msg = validate_executable_file(temp_path, expected_sha256=expected_sha256)
         if not valid:
             try:
                 os.unlink(temp_path)

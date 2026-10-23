@@ -21,28 +21,36 @@ import asyncio
 from src.security import SecurityManager
 from src.host_daemon import HostDaemon
 from src.signaling_broker import SignalingBroker
-from src.ota import get_app_version, cleanup_old_versions
+from src.ota import (
+    get_app_version,
+    cleanup_old_versions,
+    check_github_update,
+    download_github_binary,
+    apply_in_place_update
+)
 
 # ==============================================================================
-# DESIGN SYSTEM TOKENS - Apple Dark & High-End Studio
+# DESIGN SYSTEM TOKENS - Apple HIG Dark & macOS Studio
 # ==============================================================================
 THEME = {
-    "bg": "#090b11",              # Deep space obsidian
-    "card": "#131622",            # Elevated Bento surface
-    "card_border": "#212638",     # Refined 1px card outline
-    "card_hover": "#1a1f30",      # Hover on card items
-    "input_bg": "#0e1018",        # Inset field background
-    "input_border": "#252b3e",    # Subtle input border
-    "input_focus": "#38bdf8",     # Electric cyan focus ring
-    "accent": "#0284c7",          # Apple System Blue
-    "accent_hover": "#0ea5e9",    # Vibrant blue hover
-    "cyan": "#38bdf8",            # Brand cyan
-    "text_main": "#f8fafc",       # Primary crisp text
-    "text_muted": "#94a3b8",      # Secondary clean text
-    "text_dim": "#64748b",        # Caption / hint text
-    "success": "#10b981",         # Emerald success / connected
-    "warning": "#f59e0b",         # Amber
-    "danger": "#ef4444",          # Crimson disconnect
+    "bg": "#12141a",              # Apple macOS Dark Canvas (refined slate-obsidian)
+    "card": "#1a1d26",            # Elevated Grouped Bento surface
+    "card_border": "#282d3b",     # Precision 1px Apple border
+    "card_hover": "#222735",      # Subtle tactile hover
+    "input_bg": "#101217",        # Inset field background
+    "input_border": "#2d3343",    # Clean input boundary
+    "input_focus": "#0a84ff",     # Apple System Blue Focus Ring
+    "accent": "#0a84ff",          # Apple System Blue (vibrant, accessible)
+    "accent_hover": "#0071e3",    # Apple Blue pressed/hover
+    "cyan": "#38bdf8",            # Brand cyan accent
+    "text_main": "#f5f5f7",       # Primary text (SF crisp off-white)
+    "text_muted": "#a1a1a6",      # Secondary text (Apple HIG secondary)
+    "text_dim": "#6e6e73",        # Caption / hint text (Apple tertiary)
+    "success": "#30d158",         # Apple System Green
+    "warning": "#ff9f0a",         # Apple System Orange / Amber
+    "danger": "#ff453a",          # Apple System Red
+    "danger_hover": "#d73a31",    # Apple Red pressed
+    "danger_bg": "#331618",       # Red badge container
 }
 
 def bind_hover(widget, normal_bg, hover_bg, normal_fg=None, hover_fg=None):
@@ -112,10 +120,15 @@ class HostControlPanel:
         self.daemon_thread = None
         self.local_broker = None
         self.pwd_visible = False
+        self.btn_header_update = None
+        self.git_update_info = None
+        self.ota_downloading = False
 
         self._build_ui()
         self._toggle_daemon()
         self._update_status()
+
+        threading.Thread(target=lambda: self._check_git_updates_background(notify_if_none=False, prompt_on_found=True), daemon=True).start()
 
     def _get_network_endpoints(self) -> list[tuple[str, str]]:
         endpoints = []
@@ -152,52 +165,63 @@ class HostControlPanel:
         title_row = tk.Frame(header_bar, bg=THEME["bg"])
         title_row.pack(anchor="w")
 
-        lbl_dot = tk.Label(title_row, text="●", bg=THEME["bg"], fg=THEME["cyan"], font=("Segoe UI", 12, "bold"))
+        lbl_dot = tk.Label(title_row, text="●", bg=THEME["bg"], fg=THEME["success"], font=("Segoe UI", 11, "bold"))
         lbl_dot.pack(side=tk.LEFT, padx=(0, 6))
 
         lbl_brand = tk.Label(title_row, text="AETHERDESK HOST", bg=THEME["bg"], fg=THEME["text_main"],
-                             font=("Segoe UI", 16, "bold"))
+                             font=("Segoe UI", 15, "bold"))
         lbl_brand.pack(side=tk.LEFT)
 
-        lbl_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg="#161b2b", fg=THEME["cyan"],
-                             font=("Consolas", 8, "bold"), padx=6, pady=1)
+        lbl_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg=THEME["card"], fg=THEME["text_muted"],
+                             font=("Consolas", 8, "bold"), padx=6, pady=2,
+                             highlightthickness=1, highlightbackground=THEME["card_border"])
         lbl_badge.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.btn_header_update = tk.Button(
+            title_row, text="🔄 Aggiornamenti", bg=THEME["card"], fg=THEME["cyan"],
+            activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
+            relief="flat", cursor="hand2", padx=8, pady=2, highlightthickness=1,
+            highlightbackground=THEME["card_border"], command=self._on_git_update_click
+        )
+        self.btn_header_update.pack(side=tk.LEFT, padx=(8, 0))
+        bind_hover(self.btn_header_update, THEME["card"], THEME["card_hover"], THEME["cyan"], "#ffffff")
 
         lbl_sub = tk.Label(header_bar, text="Host Non Presidiato • In ascolto connessioni remote",
                            bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 9))
-        lbl_sub.pack(anchor="w", pady=(1, 0))
+        lbl_sub.pack(anchor="w", pady=(2, 0))
 
-        # 2. Bento Card: Device ID
+        # 2. Bento Card: Device ID (Apple HIG Grouped Card)
         id_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=14,
                            highlightthickness=1, highlightbackground=THEME["card_border"])
         id_card.pack(fill=tk.X, pady=(0, 10))
 
-        lbl_id_title = tk.Label(id_card, text="●  IL TUO ID DISPOSITIVO (DA DARE AL CLIENT)", bg=THEME["card"],
-                                fg=THEME["cyan"], font=("Segoe UI", 8, "bold"))
+        lbl_id_title = tk.Label(id_card, text="●  Il Tuo ID Dispositivo (da dare al client)", bg=THEME["card"],
+                                fg=THEME["accent"], font=("Segoe UI", 9, "bold"))
         lbl_id_title.pack(anchor="w", pady=(0, 6))
 
-        id_val_box = tk.Frame(id_card, bg="#0d101a", padx=12, pady=8,
+        id_val_box = tk.Frame(id_card, bg=THEME["input_bg"], padx=14, pady=8,
                               highlightthickness=1, highlightbackground=THEME["input_border"])
         id_val_box.pack(fill=tk.X)
 
         dev_id = self.security.get_or_create_device_id()
-        self.lbl_id = tk.Label(id_val_box, text=dev_id, bg="#0d101a", fg="#fbbf24",
+        self.lbl_id = tk.Label(id_val_box, text=dev_id, bg=THEME["input_bg"], fg=THEME["warning"],
                                font=("Consolas", 22, "bold"))
         self.lbl_id.pack(side=tk.LEFT)
 
-        btn_copy = tk.Button(id_val_box, text="📋 Copia ID", bg="#1b2032", fg=THEME["text_main"],
-                             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=3,
-                             command=self._copy_id)
-        btn_copy.pack(side=tk.RIGHT)
-        bind_hover(btn_copy, "#1b2032", "#262d44", THEME["text_main"], THEME["cyan"])
+        self.btn_copy_id_widget = tk.Button(id_val_box, text="📋 Copia ID", bg=THEME["card_hover"], fg=THEME["text_main"],
+                                            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=12, pady=4,
+                                            highlightthickness=1, highlightbackground=THEME["card_border"],
+                                            command=lambda: self._copy_id(btn_widget=self.btn_copy_id_widget))
+        self.btn_copy_id_widget.pack(side=tk.RIGHT)
+        bind_hover(self.btn_copy_id_widget, THEME["card_hover"], THEME["card_border"], THEME["text_main"], THEME["cyan"])
 
         # 3. Bento Card: Password Config
         pwd_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=12,
                             highlightthickness=1, highlightbackground=THEME["card_border"])
         pwd_card.pack(fill=tk.X, pady=(0, 10))
 
-        lbl_pwd_title = tk.Label(pwd_card, text="●  PASSWORD DI ACCESSO REMOTO", bg=THEME["card"],
-                                 fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+        lbl_pwd_title = tk.Label(pwd_card, text="●  Password di Accesso Remoto", bg=THEME["card"],
+                                 fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_pwd_title.pack(anchor="w", pady=(0, 6))
 
         pwd_row = tk.Frame(pwd_card, bg=THEME["input_bg"], highlightthickness=1,
@@ -208,27 +232,34 @@ class HostControlPanel:
                                   fg=THEME["text_main"], insertbackground="white", relief="flat")
         self.entry_pwd.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
         self.entry_pwd.bind("<Return>", lambda e: self._save_password())
+        self.entry_pwd.insert(0, self.security.get_password_display())
         bind_focus_ring(self.entry_pwd, pwd_row)
 
-        self.btn_eye = tk.Button(pwd_row, text="👁", bg="#1b2032", fg=THEME["text_muted"],
+        self.btn_eye = tk.Button(pwd_row, text="👁", bg=THEME["card_hover"], fg=THEME["text_muted"],
                                  font=("Segoe UI", 9), relief="flat", cursor="hand2", padx=6,
                                  command=self._toggle_pwd_view)
-        self.btn_eye.pack(side=tk.LEFT, padx=(0, 6))
-        bind_hover(self.btn_eye, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+        self.btn_eye.pack(side=tk.LEFT, padx=(0, 4))
+        bind_hover(self.btn_eye, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
-        btn_save_pwd = tk.Button(pwd_row, text="Salva Password", bg="#10b981", fg="#ffffff",
-                                 font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=2,
-                                 command=self._save_password)
-        btn_save_pwd.pack(side=tk.RIGHT)
-        bind_hover(btn_save_pwd, "#10b981", "#059669", "#ffffff", "#ffffff")
+        btn_copy_pwd = tk.Button(pwd_row, text="📋 Copia", bg=THEME["card_hover"], fg=THEME["text_muted"],
+                                 font=("Segoe UI", 9), relief="flat", cursor="hand2", padx=6,
+                                 command=lambda: self._copy_text(self.entry_pwd.get(), "Password", btn_widget=btn_copy_pwd))
+        btn_copy_pwd.pack(side=tk.LEFT, padx=(0, 6))
+        bind_hover(btn_copy_pwd, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
+
+        self.btn_save_pwd = tk.Button(pwd_row, text="Salva Password", bg=THEME["accent"], fg="#ffffff",
+                                      font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=3,
+                                      command=self._save_password)
+        self.btn_save_pwd.pack(side=tk.RIGHT)
+        bind_hover(self.btn_save_pwd, THEME["accent"], THEME["accent_hover"], "#ffffff", "#ffffff")
 
         # 4. Bento Card: Network Endpoints
         net_card = tk.Frame(container, bg=THEME["card"], padx=18, pady=12,
                             highlightthickness=1, highlightbackground=THEME["card_border"])
         net_card.pack(fill=tk.X, pady=(0, 10))
 
-        lbl_net_title = tk.Label(net_card, text="●  INDIRIZZI BROKER DA INSERIRE NEL CLIENT", bg=THEME["card"],
-                                 fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+        lbl_net_title = tk.Label(net_card, text="●  Indirizzi Broker Rilevati per il Client", bg=THEME["card"],
+                                 fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_net_title.pack(anchor="w", pady=(0, 6))
 
         for net_label, net_url in self._get_network_endpoints():
@@ -243,11 +274,12 @@ class HostControlPanel:
                              font=("Consolas", 9), padx=6, pady=2)
             lbl_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-            btn_cp = tk.Button(row, text="Copia", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
-                               font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=1,
-                               command=lambda u=net_url: self._copy_text(u, "URL"))
+            btn_cp = tk.Button(row, text="Copia", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
+                               font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=2,
+                               highlightthickness=1, highlightbackground=THEME["card_border"])
+            btn_cp.config(command=lambda u=net_url, b=btn_cp: self._copy_text(u, "URL", btn_widget=b))
             btn_cp.pack(side=tk.RIGHT)
-            bind_hover(btn_cp, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+            bind_hover(btn_cp, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
         # 5. Broker Checkbox & Url
         broker_box = tk.Frame(container, bg=THEME["card"], padx=18, pady=10,
@@ -282,23 +314,28 @@ class HostControlPanel:
         btn_row = tk.Frame(container, bg=THEME["bg"])
         btn_row.pack(fill=tk.X)
 
-        self.btn_daemon = tk.Button(btn_row, text="Arresta Demone", bg="#ef4444", fg="#ffffff",
+        self.btn_daemon = tk.Button(btn_row, text="Arresta Servizio", bg=THEME["danger"], fg="#ffffff",
+                                    activebackground=THEME["danger_hover"], activeforeground="#ffffff",
                                     font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
                                     command=self._toggle_daemon)
         self.btn_daemon.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=(0, 4))
-        bind_hover(self.btn_daemon, "#ef4444", "#dc2626", "#ffffff", "#ffffff")
+        bind_hover(self.btn_daemon, THEME["danger"], THEME["danger_hover"], "#ffffff", "#ffffff")
 
-        btn_fw = tk.Button(btn_row, text="🛡 Sblocca Firewall", bg="#1b2032", fg=THEME["warning"],
+        btn_fw = tk.Button(btn_row, text="🛡 Sblocca Firewall", bg=THEME["card"], fg=THEME["warning"],
+                           activebackground=THEME["card_hover"], activeforeground="#ffffff",
                            font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+                           highlightthickness=1, highlightbackground=THEME["card_border"],
                            command=self._open_firewall_unblock)
         btn_fw.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6, padx=4)
-        bind_hover(btn_fw, "#1b2032", "#26221c", THEME["warning"], "#fde047")
+        bind_hover(btn_fw, THEME["card"], THEME["card_hover"], THEME["warning"], "#fde047")
 
-        btn_svc = tk.Button(btn_row, text="⚙ Installa Servizio", bg="#1b2032", fg=THEME["text_muted"],
+        btn_svc = tk.Button(btn_row, text="⚙ Installa Servizio", bg=THEME["card"], fg=THEME["text_muted"],
+                            activebackground=THEME["card_hover"], activeforeground="#ffffff",
                             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+                            highlightthickness=1, highlightbackground=THEME["card_border"],
                             command=self._open_installer)
         btn_svc.pack(side=tk.RIGHT, fill=tk.X, expand=True, ipady=6, padx=(4, 0))
-        bind_hover(btn_svc, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+        bind_hover(btn_svc, THEME["card"], THEME["card_hover"], THEME["text_muted"], THEME["text_main"])
 
     def _open_firewall_unblock(self):
         bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "allow_firewall.bat"))
@@ -312,14 +349,37 @@ class HostControlPanel:
         self.entry_pwd.config(show="" if self.pwd_visible else "*")
         self.btn_eye.config(text="🙈" if self.pwd_visible else "👁")
 
-    def _copy_text(self, text: str, label: str = "Testo"):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        messagebox.showinfo("Copiato", f"{label} copiato negli appunti:\n{text}")
+    def _copy_text(self, text: str, label: str = "Testo", btn_widget: tk.Button = None):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+        if btn_widget:
+            orig_text = btn_widget.cget("text")
+            orig_fg = btn_widget.cget("fg")
+            btn_widget.config(text="✓ Copiato!", fg=THEME["success"])
+            def _revert():
+                try:
+                    btn_widget.config(text=orig_text, fg=orig_fg)
+                except Exception:
+                    pass
+            self.root.after(1400, _revert)
+        if hasattr(self, "lbl_status") and self.lbl_status and self.lbl_status.winfo_exists():
+            orig_status = self.lbl_status.cget("text")
+            orig_status_fg = self.lbl_status.cget("fg")
+            self.lbl_status.config(text=f"✓ {label} copiato negli appunti", fg=THEME["success"])
+            def _revert_status():
+                try:
+                    if self.lbl_status and self.lbl_status.winfo_exists():
+                        self.lbl_status.config(text=orig_status, fg=orig_status_fg)
+                except Exception:
+                    pass
+            self.root.after(2000, _revert_status)
 
-    def _copy_id(self):
+    def _copy_id(self, btn_widget: tk.Button = None):
         dev_id = self.security.get_or_create_device_id()
-        self._copy_text(dev_id, "ID Dispositivo")
+        self._copy_text(dev_id, "ID Dispositivo", btn_widget=btn_widget or getattr(self, "btn_copy_id_widget", None))
 
     def _save_password(self):
         new_pwd = self.entry_pwd.get().strip()
@@ -328,7 +388,15 @@ class HostControlPanel:
             return
         self.security.set_password(new_pwd)
         self.entry_pwd.delete(0, tk.END)
-        messagebox.showinfo("Successo", "Password di accesso remoto salvata con successo!")
+        if hasattr(self, "btn_save_pwd") and self.btn_save_pwd:
+            orig_text = self.btn_save_pwd.cget("text")
+            self.btn_save_pwd.config(text="✓ Salvata!", bg=THEME["success"])
+            def _revert_pwd():
+                try:
+                    self.btn_save_pwd.config(text=orig_text, bg=THEME["accent"])
+                except Exception:
+                    pass
+            self.root.after(1500, _revert_pwd)
 
     def _toggle_daemon(self):
         if not self.daemon or not self.daemon.running:
@@ -336,7 +404,7 @@ class HostControlPanel:
             self.daemon = HostDaemon(broker_url=broker_url)
             self.daemon_thread = threading.Thread(target=self._run_daemon, daemon=True)
             self.daemon_thread.start()
-            self.btn_daemon.config(text="Arresta Demone", bg="#ef4444")
+            self.btn_daemon.config(text="Arresta Servizio", bg=THEME["danger"])
             self.lbl_status.config(text="● Servizio Host Attivo (Pronto all'ascolto)", fg=THEME["success"])
         else:
             self.daemon.stop()
@@ -346,7 +414,7 @@ class HostControlPanel:
                 except Exception:
                     pass
                 self.local_broker = None
-            self.btn_daemon.config(text="Avvia Demone", bg=THEME["accent"])
+            self.btn_daemon.config(text="Avvia Servizio", bg=THEME["accent"])
             self.lbl_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
 
     def _run_daemon(self):
@@ -377,6 +445,121 @@ class HostControlPanel:
         else:
             self.lbl_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
         self.root.after(2000, self._update_status)
+
+    def _on_git_update_click(self):
+        if getattr(self, "ota_downloading", False):
+            return
+        if self.git_update_info and self.git_update_info.get("download_url"):
+            info = self.git_update_info
+            tag = info.get("tag", "")
+            size_mb = info.get("size", 0) / (1024 * 1024)
+            confirm = messagebox.askyesno(
+                "Aggiornamento Disponibile",
+                f"E' disponibile una nuova versione di AetherDesk!\n\n"
+                f"• Versione Installata: v{get_app_version()}\n"
+                f"• Nuova Versione: v{tag}\n"
+                f"• Dimensione: {size_mb:.1f} MB\n\n"
+                f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
+            )
+            if confirm:
+                self._start_git_download(info["download_url"], tag)
+        else:
+            threading.Thread(
+                target=lambda: self._check_git_updates_background(notify_if_none=True, prompt_on_found=True),
+                daemon=True
+            ).start()
+
+    def _check_git_updates_background(self, notify_if_none: bool = False, prompt_on_found: bool = False):
+        try:
+            if self.btn_header_update:
+                self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Controllo...", state=tk.DISABLED))
+
+            is_newer, info = check_github_update()
+
+            def update_ui():
+                if self.btn_header_update:
+                    self.btn_header_update.config(state=tk.NORMAL)
+
+                if is_newer and info.get("download_url"):
+                    self.git_update_info = info
+                    tag = info.get("tag", "")
+                    if self.btn_header_update:
+                        self.btn_header_update.config(
+                            text=f"⚡ Aggiorna a v{tag}",
+                            bg="#059669",
+                            fg="#ffffff"
+                        )
+                    if prompt_on_found:
+                        size_mb = info.get("size", 0) / (1024 * 1024)
+                        confirm = messagebox.askyesno(
+                            "Aggiornamento Disponibile",
+                            f"E' disponibile una nuova versione di AetherDesk!\n\n"
+                            f"• Versione Installata: v{get_app_version()}\n"
+                            f"• Nuova Versione: v{tag}\n"
+                            f"• Dimensione: {size_mb:.1f} MB\n\n"
+                            f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
+                        )
+                        if confirm:
+                            self._start_git_download(info["download_url"], tag)
+                else:
+                    err = info.get("error")
+                    if err:
+                        if self.btn_header_update:
+                            self.btn_header_update.config(text="🔄 Riprova", bg="#161b2b", fg="#f87171")
+                        if notify_if_none:
+                            messagebox.showwarning(
+                                "Controllo Aggiornamenti",
+                                f"Impossibile verificare gli aggiornamenti:\n{err}\n\nVerifica la connessione internet."
+                            )
+                    else:
+                        if self.btn_header_update:
+                            self.btn_header_update.config(
+                                text=f"✓ v{get_app_version()} (Aggiornato)",
+                                bg="#161b2b",
+                                fg="#34d399"
+                            )
+                        if notify_if_none:
+                            messagebox.showinfo(
+                                "Aggiornamenti AetherDesk",
+                                f"AetherDesk e' gia' aggiornato all'ultima versione disponibile (v{get_app_version()})."
+                            )
+            self.root.after(0, update_ui)
+        except Exception as e:
+            if self.btn_header_update:
+                self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, fg="#f87171"))
+
+    def _start_git_download(self, download_url: str, target_version: str):
+        self.ota_downloading = True
+        if self.btn_header_update:
+            self.btn_header_update.config(text="⬇ Scaricamento...", state=tk.DISABLED)
+
+        def worker():
+            def on_progress(rec, tot):
+                pct = int((rec / tot) * 100) if tot > 0 else 0
+                txt = f"⬇ {pct}%"
+                self.root.after(0, lambda: self.btn_header_update.config(text=txt) if self.btn_header_update else None)
+
+            success, temp_path_or_err = download_github_binary(download_url, progress_callback=on_progress)
+            if not success:
+                self.ota_downloading = False
+                self.root.after(0, lambda: messagebox.showerror("Errore Download", f"Impossibile scaricare l'aggiornamento:\n{temp_path_or_err}"))
+                self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, bg="#161b2b", fg="#f87171") if self.btn_header_update else None)
+                return
+
+            applied, app_msg = apply_in_place_update(temp_path_or_err, target_version=target_version)
+            self.ota_downloading = False
+            if applied:
+                self.root.after(0, lambda: messagebox.showinfo("Aggiornamento Riuscito", app_msg))
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                sys.exit(0)
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Errore Installazione", f"Impossibile applicare l'aggiornamento:\n{app_msg}"))
+                self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL) if self.btn_header_update else None)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def run(self):
         self.root.mainloop()

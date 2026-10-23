@@ -101,6 +101,17 @@ class HostDaemon:
                 derived_key = self.security.derive_session_key(bytes.fromhex(master_hex), salt)
             else:
                 derived_key = self.security.derive_session_key("default_password", salt)
+
+            if binary:
+                try:
+                    dec = self.security.decrypt_packet(binary, derived_key)
+                    if dec != b"AETHER_AUTH_V1":
+                        session_state["authenticated"] = False
+                        return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Credenziali non valide"})
+                except Exception:
+                    session_state["authenticated"] = False
+                    return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Password errata"})
+
             session_state["session_key"] = derived_key
             session_state["authenticated"] = True
 
@@ -261,16 +272,19 @@ class HostDaemon:
                 break
 
             # Backpressure / Flow control: wait for client to finish processing previous frame
-            # This completely eliminates WebSocket bufferbloat and multi-second cursor lag!
+            # If viewer or network is saturated, drop frame generation to keep input channel free
+            missed_ack = False
             if self._in_flight_frame:
                 try:
                     await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.06)
                 except asyncio.TimeoutError:
-                    pass
-                self._in_flight_frame = False
-                self._frame_ack_event.clear()
+                    missed_ack = True
+                finally:
+                    self._in_flight_frame = False
+                    self._frame_ack_event.clear()
 
             start_t = time.time()
+            t_cap_start = time.perf_counter_ns()
             try:
                 # Check clipboard change
                 if self.clipboard.has_changed():
@@ -281,11 +295,25 @@ class HostDaemon:
                         await websocket.send(clip_msg)
 
                 frame_counter += 1
-                force_keyframe = (frame_counter == 1 or frame_counter % 30 == 0)
+                force_keyframe = (frame_counter == 1 or frame_counter % 30 == 0 or missed_ack)
                 jpeg_bytes, size, cur = self.capture.capture_frame(only_if_changed=(not force_keyframe))
+                t_cap_done = time.perf_counter_ns()
+
                 if jpeg_bytes:
+                    t_enc_start = time.perf_counter_ns()
                     encrypted = self.security.encrypt_packet(jpeg_bytes, session_key)
-                    meta = {"w": size[0], "h": size[1], "cx": cur[0], "cy": cur[1], "fid": frame_counter}
+                    t_enc_done = time.perf_counter_ns()
+
+                    meta = {
+                        "w": size[0],
+                        "h": size[1],
+                        "cx": cur[0],
+                        "cy": cur[1],
+                        "fid": frame_counter,
+                        "t_send": time.time(),
+                        "cap_ms": round((t_cap_done - t_cap_start) / 1e6, 2),
+                        "enc_ms": round((t_enc_done - t_enc_start) / 1e6, 2)
+                    }
                     msg = ProtocolMessage.serialize("FRAME", meta, binary_data=encrypted)
                     self._in_flight_frame = True
                     self._frame_ack_event.clear()
@@ -372,6 +400,9 @@ class HostDaemon:
                             resp_bytes = self.handle_client_message(msg_type, payload, binary, session_state)
                             if resp_bytes:
                                 await ws.send(resp_bytes)
+                            if not session_state.get("authenticated", True):
+                                if stream_task and not stream_task.done():
+                                    stream_task.cancel()
 
             except (websockets.exceptions.ConnectionClosed, OSError, Exception) as e:
                 logger.warning(f"Broker connection error: {e}. Retrying in 3s...")

@@ -40,30 +40,33 @@ from src.ota import (
 )
 
 # ==============================================================================
-# DESIGN SYSTEM TOKENS - Apple Dark & High-End Studio
+# DESIGN SYSTEM TOKENS - Apple HIG Dark & macOS Studio
 # ==============================================================================
 THEME = {
-    "bg": "#090b11",              # Deep space obsidian
-    "card": "#131622",            # Elevated Bento surface
-    "card_border": "#212638",     # Refined 1px card outline
-    "card_hover": "#1a1f30",      # Hover on card items
-    "input_bg": "#0e1018",        # Inset field background
-    "input_border": "#252b3e",    # Subtle input border
-    "input_focus": "#38bdf8",     # Electric cyan focus ring
-    "accent": "#0284c7",          # Apple System Blue
-    "accent_hover": "#0ea5e9",    # Vibrant blue hover
-    "cyan": "#38bdf8",            # Brand cyan
-    "text_main": "#f8fafc",       # Primary crisp text
-    "text_muted": "#94a3b8",      # Secondary clean text
-    "text_dim": "#64748b",        # Caption / hint text
-    "success": "#10b981",         # Emerald success / connected
-    "success_bg": "#052e20",      # Emerald badge background
-    "warning": "#f59e0b",         # Amber
-    "danger": "#ef4444",          # Crimson disconnect
-    "tab_active_bg": "#23293e",
-    "tab_active_fg": "#f8fafc",
-    "tab_inactive_bg": "#121520",
-    "tab_inactive_fg": "#94a3b8",
+    "bg": "#12141a",              # Apple macOS Dark Canvas (refined slate-obsidian)
+    "card": "#1a1d26",            # Elevated Grouped Bento surface
+    "card_border": "#282d3b",     # Precision 1px Apple border
+    "card_hover": "#222735",      # Subtle tactile hover
+    "input_bg": "#101217",        # Inset field background
+    "input_border": "#2d3343",    # Clean input boundary
+    "input_focus": "#0a84ff",     # Apple System Blue Focus Ring
+    "accent": "#0a84ff",          # Apple System Blue (vibrant, accessible)
+    "accent_hover": "#0071e3",    # Apple Blue pressed/hover
+    "cyan": "#38bdf8",            # Brand cyan accent
+    "text_main": "#f5f5f7",       # Primary text (SF crisp off-white)
+    "text_muted": "#a1a1a6",      # Secondary text (Apple HIG secondary)
+    "text_dim": "#6e6e73",        # Caption / hint text (Apple tertiary)
+    "success": "#30d158",         # Apple System Green
+    "success_bg": "#0c2817",      # Emerald badge container
+    "warning": "#ff9f0a",         # Apple System Orange / Amber
+    "danger": "#ff453a",          # Apple System Red
+    "danger_hover": "#d73a31",    # Apple Red pressed
+    "danger_bg": "#331618",       # Red badge container
+    "tab_active_bg": "#2b3242",   # Elevated active segmented pill
+    "tab_active_fg": "#ffffff",
+    "tab_inactive_bg": "#13161e", # Segmented pill track
+    "tab_inactive_fg": "#8e8e93",
+    "toolbar_bg": "#181a24",      # Apple floating frosted toolbar
 }
 
 def bind_hover(widget, normal_bg, hover_bg, normal_fg=None, hover_fg=None):
@@ -132,6 +135,33 @@ class ClientViewerGUI:
             except Exception:
                 pass
 
+        # Apple HIG modern dark ttk theme initialization
+        try:
+            style = ttk.Style()
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            style.configure(
+                "TCombobox",
+                fieldbackground=THEME["input_bg"],
+                background=THEME["card"],
+                foreground=THEME["text_main"],
+                arrowcolor=THEME["accent"],
+                bordercolor=THEME["input_border"],
+                lightcolor=THEME["input_border"],
+                darkcolor=THEME["input_border"]
+            )
+            style.map(
+                "TCombobox",
+                fieldbackground=[("readonly", THEME["input_bg"]), ("focus", THEME["input_bg"])],
+                foreground=[("readonly", THEME["text_main"]), ("focus", THEME["text_main"])]
+            )
+            self.root.option_add("*TCombobox*Listbox.background", THEME["card"])
+            self.root.option_add("*TCombobox*Listbox.foreground", THEME["text_main"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground", THEME["accent"])
+            self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        except Exception:
+            pass
+
         # Purge any leftover previous version backup files or staging scripts
         try:
             cleanup_old_versions()
@@ -146,6 +176,7 @@ class ClientViewerGUI:
         self.client.on_ota_info_callback = self._on_ota_info
         self.client.on_ota_progress_callback = self._on_ota_progress
         self.client.on_ota_complete_callback = self._on_ota_complete
+        self.client.on_monitors_callback = self._on_monitors_received
 
         # Host daemon integrated management
         self.security = SecurityManager()
@@ -163,6 +194,19 @@ class ClientViewerGUI:
         self.current_img_dims = (0, 0)
         self._canvas_img_id = None
         self.pwd_visible = False
+
+        # Dual-Window Multi-Monitor State
+        self.dual_window_mode = False
+        self.viewer_window_m2 = None
+        self.canvas_m2 = None
+        self.photo_img_m2 = None
+        self.current_img_dims_m2 = (0, 0)
+        self._canvas_img_id_m2 = None
+        self.remote_monitors = []
+        self.btn_mdual = None
+        self._crop_m1 = (0, 0, 1920, 1080)
+        self._crop_m2 = (1920, 0, 3840, 1080)
+        self._last_full_dims = (1920, 1080)
         self._pending_frame = None
         self._render_scheduled = False
 
@@ -175,10 +219,14 @@ class ClientViewerGUI:
         self.btn_git_update = None
         self.btn_header_update = None
 
-        # FPS metrics
+        # FPS & Pipeline Telemetry metrics
         self._frame_count = 0
         self._last_fps_time = time.time()
         self._current_fps = 0
+        self._latencies = []
+        self._render_latencies = []
+        self._current_latency = 0.0
+        self._current_render_ms = 0.0
         self.lbl_fps = None
 
         self.active_tab = start_tab
@@ -275,62 +323,63 @@ class ClientViewerGUI:
         header_bar = tk.Frame(container, bg=THEME["bg"])
         header_bar.pack(fill=tk.X, pady=(0, 16))
 
-        # Brand Identity (Apple Typography & Status Pill)
+        # Brand Identity (Apple HIG Typography & Status Pill)
         brand_frame = tk.Frame(header_bar, bg=THEME["bg"])
         brand_frame.pack(side=tk.LEFT)
 
         title_row = tk.Frame(brand_frame, bg=THEME["bg"])
         title_row.pack(anchor="w")
 
-        lbl_dot = tk.Label(title_row, text="●", bg=THEME["bg"], fg=THEME["cyan"], font=("Segoe UI", 12, "bold"))
+        lbl_dot = tk.Label(title_row, text="●", bg=THEME["bg"], fg=THEME["success"], font=("Segoe UI", 11, "bold"))
         lbl_dot.pack(side=tk.LEFT, padx=(0, 6))
 
         lbl_brand = tk.Label(title_row, text="AETHERDESK", bg=THEME["bg"], fg=THEME["text_main"],
-                             font=("Segoe UI", 16, "bold"))
+                             font=("Segoe UI", 15, "bold"))
         lbl_brand.pack(side=tk.LEFT)
 
-        lbl_ver_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg="#161b2b", fg=THEME["cyan"],
-                                 font=("Consolas", 8, "bold"), padx=6, pady=1)
+        lbl_ver_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg=THEME["card"], fg=THEME["text_muted"],
+                                 font=("Consolas", 8, "bold"), padx=6, pady=2,
+                                 highlightthickness=1, highlightbackground=THEME["card_border"])
         lbl_ver_badge.pack(side=tk.LEFT, padx=(8, 0))
 
         self.btn_header_update = tk.Button(
-            title_row, text="🔄 Controlla Aggiornamenti", bg="#161b2b", fg=THEME["cyan"],
-            activebackground="#20283e", activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
-            relief="flat", cursor="hand2", padx=8, pady=1, highlightthickness=1,
+            title_row, text="🔄 Aggiornamenti", bg=THEME["card"], fg=THEME["cyan"],
+            activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
+            relief="flat", cursor="hand2", padx=8, pady=2, highlightthickness=1,
             highlightbackground=THEME["card_border"], command=self._on_git_update_click
         )
         self.btn_header_update.pack(side=tk.LEFT, padx=(8, 0))
-        bind_hover(self.btn_header_update, "#161b2b", "#20283e", THEME["cyan"], "#ffffff")
+        bind_hover(self.btn_header_update, THEME["card"], THEME["card_hover"], THEME["cyan"], "#ffffff")
 
         lbl_sub = tk.Label(brand_frame, text="Controllo Remoto Ultra-Leggero • Crittografia E2EE",
                            bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 9))
-        lbl_sub.pack(anchor="w", pady=(1, 0))
+        lbl_sub.pack(anchor="w", pady=(2, 0))
 
-        # Segmented Tab Pill [ 💻 Connetti | 🖥 Host ]
-        tab_capsule = tk.Frame(header_bar, bg="#121520", padx=3, pady=3,
+        # Segmented Control Pill [ 💻 Connetti | 🖥 Questo PC ] (Apple macOS HIG style)
+        tab_capsule = tk.Frame(header_bar, bg=THEME["tab_inactive_bg"], padx=3, pady=3,
                                highlightthickness=1, highlightbackground=THEME["card_border"])
         tab_capsule.pack(side=tk.RIGHT)
 
         self.btn_tab_client = tk.Button(
             tab_capsule, text="💻 Connetti", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
-            padx=12, pady=3, highlightthickness=0,
-            bg=THEME["tab_active_bg"] if self.active_tab == "client" else "#121520",
-            fg=THEME["tab_active_fg"] if self.active_tab == "client" else THEME["text_muted"],
+            padx=14, pady=4, highlightthickness=0,
+            bg=THEME["tab_active_bg"] if self.active_tab == "client" else THEME["tab_inactive_bg"],
+            fg=THEME["tab_active_fg"] if self.active_tab == "client" else THEME["tab_inactive_fg"],
             command=lambda: self._switch_tab("client")
         )
         self.btn_tab_client.pack(side=tk.LEFT)
 
         self.btn_tab_host = tk.Button(
             tab_capsule, text="🖥 Questo PC", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
-            padx=12, pady=3, highlightthickness=0,
-            bg=THEME["tab_active_bg"] if self.active_tab == "host" else "#121520",
-            fg=THEME["tab_active_fg"] if self.active_tab == "host" else THEME["text_muted"],
+            padx=14, pady=4, highlightthickness=0,
+            bg=THEME["tab_active_bg"] if self.active_tab == "host" else THEME["tab_inactive_bg"],
+            fg=THEME["tab_active_fg"] if self.active_tab == "host" else THEME["tab_inactive_fg"],
             command=lambda: self._switch_tab("host")
         )
         self.btn_tab_host.pack(side=tk.LEFT, padx=(2, 0))
 
-        bind_hover(self.btn_tab_client, "#121520", "#1c2235", THEME["text_muted"], THEME["text_main"])
-        bind_hover(self.btn_tab_host, "#121520", "#1c2235", THEME["text_muted"], THEME["text_main"])
+        bind_hover(self.btn_tab_client, THEME["tab_inactive_bg"], THEME["card_hover"], THEME["tab_inactive_fg"], THEME["text_main"])
+        bind_hover(self.btn_tab_host, THEME["tab_inactive_bg"], THEME["card_hover"], THEME["tab_inactive_fg"], THEME["text_main"])
 
         # Main Body Frame (Swapped by tabs)
         self.body_frame = tk.Frame(container, bg=THEME["bg"])
@@ -350,22 +399,22 @@ class ClientViewerGUI:
         lbl_foot_sec.pack(side=tk.LEFT)
 
         self.btn_git_update = tk.Button(
-            footer, text="🔄 Controlla Aggiornamenti", bg="#141824", fg=THEME["text_muted"],
-            activebackground="#20263a", activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
+            footer, text="🔄 Controlla Aggiornamenti", bg=THEME["card"], fg=THEME["text_muted"],
+            activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
             relief="flat", cursor="hand2", padx=10, pady=3, highlightthickness=1,
             highlightbackground=THEME["card_border"], command=self._on_git_update_click
         )
         self.btn_git_update.pack(side=tk.RIGHT)
-        bind_hover(self.btn_git_update, "#141824", "#1d2335", THEME["text_muted"], THEME["cyan"])
+        bind_hover(self.btn_git_update, THEME["card"], THEME["card_hover"], THEME["text_muted"], THEME["cyan"])
 
     def _switch_tab(self, tab: str):
         self.active_tab = tab
         if tab == "client":
             self.btn_tab_client.config(bg=THEME["tab_active_bg"], fg=THEME["tab_active_fg"])
-            self.btn_tab_host.config(bg="#121520", fg=THEME["text_muted"])
+            self.btn_tab_host.config(bg=THEME["tab_inactive_bg"], fg=THEME["tab_inactive_fg"])
         else:
             self.btn_tab_host.config(bg=THEME["tab_active_bg"], fg=THEME["tab_active_fg"])
-            self.btn_tab_client.config(bg="#121520", fg=THEME["text_muted"])
+            self.btn_tab_client.config(bg=THEME["tab_inactive_bg"], fg=THEME["tab_inactive_fg"])
 
         for w in self.body_frame.winfo_children():
             w.destroy()
@@ -385,12 +434,12 @@ class ClientViewerGUI:
                              highlightthickness=1, highlightbackground=THEME["card_border"])
         conn_card.pack(fill=tk.X, pady=(0, 12))
 
-        lbl_card_title = tk.Label(conn_card, text="●  CONTROLLA UN COMPUTER REMOTO", bg=THEME["card"],
-                                  fg=THEME["cyan"], font=("Segoe UI", 8, "bold"))
+        lbl_card_title = tk.Label(conn_card, text="●  Connessione Remota", bg=THEME["card"],
+                                  fg=THEME["accent"], font=("Segoe UI", 9, "bold"))
         lbl_card_title.pack(anchor="w", pady=(0, 10))
 
         # 1. Device ID Field
-        lbl_id = tk.Label(conn_card, text="ID Computer (9 cifre):", bg=THEME["card"],
+        lbl_id = tk.Label(conn_card, text="ID Computer Remoto (9 cifre):", bg=THEME["card"],
                           fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_id.pack(anchor="w", pady=(0, 4))
 
@@ -406,18 +455,18 @@ class ClientViewerGUI:
         self.combo_id.bind("<Return>", lambda e: self._start_connect())
         bind_focus_ring(self.combo_id, id_box)
 
-        btn_paste_id = tk.Button(id_box, text="Incolla", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
+        btn_paste_id = tk.Button(id_box, text="Incolla", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
                                  font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=2, command=self._paste_id)
         btn_paste_id.pack(side=tk.RIGHT, padx=(4, 0))
-        bind_hover(btn_paste_id, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+        bind_hover(btn_paste_id, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
         # 2. Password Field
         lbl_pwd = tk.Label(conn_card, text="Password di Accesso:", bg=THEME["card"],
-                           fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
+                          fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_pwd.pack(anchor="w", pady=(0, 4))
 
         pwd_box = tk.Frame(conn_card, bg=THEME["input_bg"], highlightthickness=1,
-                           highlightbackground=THEME["input_border"], padx=8, pady=4)
+                          highlightbackground=THEME["input_border"], padx=8, pady=4)
         pwd_box.pack(fill=tk.X, pady=(0, 10))
 
         self.entry_pwd = tk.Entry(pwd_box, font=("Segoe UI", 11), show="*", bg=THEME["input_bg"],
@@ -426,12 +475,14 @@ class ClientViewerGUI:
         self.entry_pwd.bind("<Return>", lambda e: self._start_connect())
         if saved_pwd:
             self.entry_pwd.insert(0, saved_pwd)
+        else:
+            self.entry_pwd.insert(0, self.security.get_password_display())
         bind_focus_ring(self.entry_pwd, pwd_box)
 
-        self.btn_pwd_toggle = tk.Button(pwd_box, text="👁", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
+        self.btn_pwd_toggle = tk.Button(pwd_box, text="👁", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
                                         font=("Segoe UI", 9), cursor="hand2", padx=6, pady=2, command=self._toggle_pwd_view)
         self.btn_pwd_toggle.pack(side=tk.RIGHT)
-        bind_hover(self.btn_pwd_toggle, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+        bind_hover(self.btn_pwd_toggle, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
         # 3. Server Broker URL
         lbl_broker = tk.Label(conn_card, text="Server Broker (IP o Dominio):", bg=THEME["card"],
@@ -439,7 +490,7 @@ class ClientViewerGUI:
         lbl_broker.pack(anchor="w", pady=(0, 4))
 
         brk_box = tk.Frame(conn_card, bg=THEME["input_bg"], highlightthickness=1,
-                           highlightbackground=THEME["input_border"], padx=8, pady=4)
+                          highlightbackground=THEME["input_border"], padx=8, pady=4)
         brk_box.pack(fill=tk.X, pady=(0, 6))
 
         self.entry_broker = tk.Entry(brk_box, font=("Consolas", 10), bg=THEME["input_bg"],
@@ -449,10 +500,10 @@ class ClientViewerGUI:
         self.entry_broker.insert(0, saved_broker if saved_broker else "ws://127.0.0.1:8765")
         bind_focus_ring(self.entry_broker, brk_box)
 
-        btn_paste_brk = tk.Button(brk_box, text="Incolla", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
+        btn_paste_brk = tk.Button(brk_box, text="Incolla", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
                                   font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=2, command=self._paste_broker)
         btn_paste_brk.pack(side=tk.RIGHT)
-        bind_hover(btn_paste_brk, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+        bind_hover(btn_paste_brk, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
         # Quick Broker Preset Chips
         chips_frame = tk.Frame(conn_card, bg=THEME["card"])
@@ -462,11 +513,12 @@ class ClientViewerGUI:
             self.entry_broker.delete(0, tk.END)
             self.entry_broker.insert(0, url)
 
-        btn_chip_local = tk.Button(chips_frame, text="🏠 Locale (127.0.0.1)", bg="#161a29", fg=THEME["text_dim"],
-                                   font=("Segoe UI", 8), relief="flat", cursor="hand2", padx=6, pady=1,
+        btn_chip_local = tk.Button(chips_frame, text="🏠 Locale (127.0.0.1)", bg=THEME["card_hover"], fg=THEME["text_dim"],
+                                   font=("Segoe UI", 8), relief="flat", cursor="hand2", padx=8, pady=2,
+                                   highlightthickness=1, highlightbackground=THEME["card_border"],
                                    command=lambda: _set_brk("ws://127.0.0.1:8765"))
         btn_chip_local.pack(side=tk.LEFT, padx=(0, 4))
-        bind_hover(btn_chip_local, "#161a29", "#20263c", THEME["text_dim"], THEME["cyan"])
+        bind_hover(btn_chip_local, THEME["card_hover"], THEME["card_border"], THEME["text_dim"], THEME["cyan"])
 
         # Remember Checkbox
         self.var_remember = tk.BooleanVar(value=saved_rem)
@@ -478,7 +530,7 @@ class ClientViewerGUI:
         )
         self.chk_remember.pack(anchor="w", pady=(0, 12))
 
-        # Primary Action Button (Apple / High-End CTA)
+        # Primary Action Button (Apple System Blue CTA)
         self.btn_connect = tk.Button(
             conn_card, text="🚀  Connetti al Computer", bg=THEME["accent"], fg="#ffffff",
             activebackground=THEME["accent_hover"], activeforeground="#ffffff",
@@ -498,8 +550,8 @@ class ClientViewerGUI:
                                    highlightthickness=1, highlightbackground=THEME["card_border"])
             quick_frame.pack(fill=tk.X)
 
-            lbl_q_title = tk.Label(quick_frame, text="●  DISPOSITIVI RECENTI & SALVATI", bg=THEME["card"],
-                                   fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+            lbl_q_title = tk.Label(quick_frame, text="●  Dispositivi Recenti & Salvati", bg=THEME["card"],
+                                   fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
             lbl_q_title.pack(anchor="w", pady=(0, 3))
 
             lbl_q_hint = tk.Label(quick_frame, text="Seleziona un dispositivo per compilare automaticamente i campi:",
@@ -529,13 +581,13 @@ class ClientViewerGUI:
                                  font=("Consolas", 8), anchor="w")
                 lbl_b.pack(anchor="w")
 
-                btn_sel = tk.Button(row, text="Seleziona", bg="#161b2b", fg=THEME["cyan"],
-                                    activebackground="#20283e", activeforeground="#ffffff",
+                btn_sel = tk.Button(row, text="Seleziona", bg=THEME["card_hover"], fg=THEME["cyan"],
+                                    activebackground=THEME["card_border"], activeforeground="#ffffff",
                                     font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=12, pady=3,
                                     highlightthickness=1, highlightbackground=THEME["card_border"],
                                     command=lambda d=dev: self._select_saved_device(d))
                 btn_sel.pack(side=tk.RIGHT)
-                bind_hover(btn_sel, "#161b2b", "#20283e", THEME["cyan"], "#ffffff")
+                bind_hover(btn_sel, THEME["card_hover"], THEME["card_border"], THEME["cyan"], "#ffffff")
 
     def _render_host_tab(self, parent):
         # Card 1: This Machine ID & Status
@@ -543,35 +595,36 @@ class ClientViewerGUI:
                              highlightthickness=1, highlightbackground=THEME["card_border"])
         host_card.pack(fill=tk.X, pady=(0, 12))
 
-        lbl_h_title = tk.Label(host_card, text="●  I TUOI DATI PER RICEVERE ASSISTENZA", bg=THEME["card"],
-                               fg=THEME["cyan"], font=("Segoe UI", 8, "bold"))
+        lbl_h_title = tk.Label(host_card, text="●  Assistenza e Condivisione", bg=THEME["card"],
+                               fg=THEME["accent"], font=("Segoe UI", 9, "bold"))
         lbl_h_title.pack(anchor="w", pady=(0, 10))
 
-        # Big Monospace ID Display
-        id_display_box = tk.Frame(host_card, bg="#0d101a", padx=14, pady=10,
+        # Big Monospace ID Display (Apple HIG Grouped Display)
+        id_display_box = tk.Frame(host_card, bg=THEME["input_bg"], padx=14, pady=10,
                                   highlightthickness=1, highlightbackground=THEME["input_border"])
         id_display_box.pack(fill=tk.X, pady=(0, 12))
 
         lbl_id_hint = tk.Label(id_display_box, text="ID DISPOSITIVO (DA FORNIRE A CHI SI CONNETTE):",
-                               bg="#0d101a", fg=THEME["text_dim"], font=("Segoe UI", 8, "bold"))
+                               bg=THEME["input_bg"], fg=THEME["text_dim"], font=("Segoe UI", 8, "bold"))
         lbl_id_hint.pack(anchor="w")
 
-        id_val_row = tk.Frame(id_display_box, bg="#0d101a")
+        id_val_row = tk.Frame(id_display_box, bg=THEME["input_bg"])
         id_val_row.pack(fill=tk.X, pady=(4, 0))
 
         dev_id = self.security.get_or_create_device_id()
-        lbl_id_val = tk.Label(id_val_row, text=dev_id, bg="#0d101a", fg="#fbbf24",
+        lbl_id_val = tk.Label(id_val_row, text=dev_id, bg=THEME["input_bg"], fg=THEME["warning"],
                               font=("Consolas", 22, "bold"))
         lbl_id_val.pack(side=tk.LEFT)
 
-        btn_copy_id = tk.Button(id_val_row, text="📋 Copia ID", bg="#1b2032", fg=THEME["text_main"],
-                                font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=4,
-                                command=lambda: self._copy_text(dev_id, "ID Dispositivo"))
+        btn_copy_id = tk.Button(id_val_row, text="📋 Copia ID", bg=THEME["card_hover"], fg=THEME["text_main"],
+                                font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=12, pady=4,
+                                highlightthickness=1, highlightbackground=THEME["card_border"])
+        btn_copy_id.config(command=lambda: self._copy_text(dev_id, "ID Dispositivo", btn_widget=btn_copy_id))
         btn_copy_id.pack(side=tk.RIGHT)
-        bind_hover(btn_copy_id, "#1b2032", "#262d44", THEME["text_main"], THEME["cyan"])
+        bind_hover(btn_copy_id, THEME["card_hover"], THEME["card_border"], THEME["text_main"], THEME["cyan"])
 
         # Password Config
-        lbl_pwd_h = tk.Label(host_card, text="Password di Accesso:", bg=THEME["card"],
+        lbl_pwd_h = tk.Label(host_card, text="Password di Accesso Remoto:", bg=THEME["card"],
                              fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_pwd_h.pack(anchor="w", pady=(0, 4))
 
@@ -582,13 +635,31 @@ class ClientViewerGUI:
         self.entry_host_pwd = tk.Entry(pwd_row, show="*", font=("Segoe UI", 11), bg=THEME["input_bg"],
                                        fg=THEME["text_main"], insertbackground="white", relief="flat")
         self.entry_host_pwd.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        self.entry_host_pwd.insert(0, self.security.get_password_display())
         bind_focus_ring(self.entry_host_pwd, pwd_row)
 
-        btn_save_host_pwd = tk.Button(pwd_row, text="Salva Password", bg="#10b981", fg="#ffffff",
-                                      font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=8, pady=2,
-                                      command=self._save_host_password)
-        btn_save_host_pwd.pack(side=tk.RIGHT)
-        bind_hover(btn_save_host_pwd, "#10b981", "#059669", "#ffffff", "#ffffff")
+        self.host_pwd_visible = False
+        def _toggle_h_pwd():
+            self.host_pwd_visible = not self.host_pwd_visible
+            self.entry_host_pwd.config(show="" if self.host_pwd_visible else "*")
+            btn_h_eye.config(text="🙈" if self.host_pwd_visible else "👁")
+
+        btn_h_eye = tk.Button(pwd_row, text="👁", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
+                              font=("Segoe UI", 9), cursor="hand2", padx=6, command=_toggle_h_pwd)
+        btn_h_eye.pack(side=tk.LEFT, padx=(0, 4))
+        bind_hover(btn_h_eye, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
+
+        btn_cp_h_pwd = tk.Button(pwd_row, text="📋 Copia", bg=THEME["card_hover"], fg=THEME["text_muted"],
+                                 font=("Segoe UI", 9), relief="flat", cursor="hand2", padx=6,
+                                 command=lambda: self._copy_text(self.entry_host_pwd.get(), "Password", btn_widget=btn_cp_h_pwd))
+        btn_cp_h_pwd.pack(side=tk.LEFT, padx=(0, 6))
+        bind_hover(btn_cp_h_pwd, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
+
+        self.btn_save_host_pwd = tk.Button(pwd_row, text="Salva Password", bg=THEME["accent"], fg="#ffffff",
+                                           font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=10, pady=3,
+                                           command=self._save_host_password)
+        self.btn_save_host_pwd.pack(side=tk.RIGHT)
+        bind_hover(self.btn_save_host_pwd, THEME["accent"], THEME["accent_hover"], "#ffffff", "#ffffff")
 
         # Daemon State Control & Status
         daemon_row = tk.Frame(host_card, bg=THEME["card"])
@@ -597,7 +668,7 @@ class ClientViewerGUI:
         is_running = bool(self.host_daemon and self.host_daemon.running)
         self.lbl_host_status = tk.Label(
             daemon_row,
-            text="● Servizio Host Attivo (In ascolto su porta 8765)" if is_running else "● Servizio Host non attivo",
+            text="● Servizio Host Attivo (Porta 8765)" if is_running else "● Servizio Host non attivo",
             bg=THEME["card"], fg=THEME["success"] if is_running else THEME["text_dim"],
             font=("Segoe UI", 9, "bold")
         )
@@ -605,20 +676,24 @@ class ClientViewerGUI:
 
         self.btn_host_toggle = tk.Button(
             daemon_row,
-            text="Arresta" if is_running else "Avvia Demone",
-            bg="#ef4444" if is_running else THEME["accent"], fg="#ffffff",
+            text="Arresta Servizio" if is_running else "Avvia Servizio",
+            bg=THEME["danger"] if is_running else THEME["accent"], fg="#ffffff",
             font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2", padx=12, pady=4,
             command=self._toggle_host_daemon
         )
         self.btn_host_toggle.pack(side=tk.RIGHT)
+        bind_hover(self.btn_host_toggle,
+                   THEME["danger"] if is_running else THEME["accent"],
+                   THEME["danger_hover"] if is_running else THEME["accent_hover"],
+                   "#ffffff", "#ffffff")
 
         # Card 2: Detected LAN / Wi-Fi Endpoints
         net_card = tk.Frame(parent, bg=THEME["card"], padx=18, pady=12,
                             highlightthickness=1, highlightbackground=THEME["card_border"])
         net_card.pack(fill=tk.X, pady=(0, 10))
 
-        lbl_net_title = tk.Label(net_card, text="●  INDIRIZZI BROKER RILEVATI PER IL CLIENT", bg=THEME["card"],
-                                 fg=THEME["text_muted"], font=("Segoe UI", 8, "bold"))
+        lbl_net_title = tk.Label(net_card, text="●  Indirizzi Broker Rilevati per il Client", bg=THEME["card"],
+                                 fg=THEME["text_muted"], font=("Segoe UI", 9, "bold"))
         lbl_net_title.pack(anchor="w", pady=(0, 6))
 
         for net_label, net_url in self._get_network_endpoints():
@@ -633,32 +708,58 @@ class ClientViewerGUI:
                              font=("Consolas", 9), padx=6, pady=2)
             lbl_u.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-            btn_cp = tk.Button(row, text="Copia", bg="#1b2032", fg=THEME["text_muted"], relief="flat",
-                               font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=1,
-                               command=lambda u=net_url: self._copy_text(u, "URL"))
+            btn_cp = tk.Button(row, text="Copia", bg=THEME["card_hover"], fg=THEME["text_muted"], relief="flat",
+                               font=("Segoe UI", 8, "bold"), cursor="hand2", padx=8, pady=2,
+                               highlightthickness=1, highlightbackground=THEME["card_border"])
+            btn_cp.config(command=lambda u=net_url, b=btn_cp: self._copy_text(u, "URL", btn_widget=b))
             btn_cp.pack(side=tk.RIGHT)
-            bind_hover(btn_cp, "#1b2032", "#262d44", THEME["text_muted"], THEME["text_main"])
+            bind_hover(btn_cp, THEME["card_hover"], THEME["card_border"], THEME["text_muted"], THEME["text_main"])
 
         # Quick System Tools
         tools_row = tk.Frame(parent, bg=THEME["bg"])
         tools_row.pack(fill=tk.X, pady=(2, 0))
 
-        btn_fw = tk.Button(tools_row, text="🛡 Sblocca Firewall Windows", bg="#161b29", fg=THEME["warning"],
-                           font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=10, pady=4,
+        btn_fw = tk.Button(tools_row, text="🛡 Sblocca Firewall Windows", bg=THEME["card"], fg=THEME["warning"],
+                           font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=10, pady=5,
+                           highlightthickness=1, highlightbackground=THEME["card_border"],
                            command=self._open_firewall_unblock)
         btn_fw.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        bind_hover(btn_fw, "#161b29", "#242018", THEME["warning"], "#fde047")
+        bind_hover(btn_fw, THEME["card"], THEME["card_hover"], THEME["warning"], "#fde047")
 
-        btn_svc = tk.Button(tools_row, text="⚙ Installa come Servizio Windows", bg="#161b29", fg=THEME["text_muted"],
-                            font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=10, pady=4,
+        btn_svc = tk.Button(tools_row, text="⚙ Installa come Servizio Windows", bg=THEME["card"], fg=THEME["text_muted"],
+                            font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=10, pady=5,
+                            highlightthickness=1, highlightbackground=THEME["card_border"],
                             command=self._open_installer)
         btn_svc.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
-        bind_hover(btn_svc, "#161b29", "#20263c", THEME["text_muted"], THEME["text_main"])
+        bind_hover(btn_svc, THEME["card"], THEME["card_hover"], THEME["text_muted"], THEME["text_main"])
 
-    def _copy_text(self, text: str, label: str = "Testo"):
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        messagebox.showinfo("Copiato", f"{label} copiato negli appunti:\n{text}")
+    def _copy_text(self, text: str, label: str = "Testo", btn_widget: tk.Button = None):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+        if btn_widget:
+            orig_text = btn_widget.cget("text")
+            orig_fg = btn_widget.cget("fg")
+            btn_widget.config(text="✓ Copiato!", fg=THEME["success"])
+            def _revert():
+                try:
+                    btn_widget.config(text=orig_text, fg=orig_fg)
+                except Exception:
+                    pass
+            self.root.after(1400, _revert)
+        if hasattr(self, "lbl_status") and self.lbl_status and self.lbl_status.winfo_exists():
+            orig_status = self.lbl_status.cget("text")
+            orig_status_fg = self.lbl_status.cget("fg")
+            self.lbl_status.config(text=f"✓ {label} copiato negli appunti", fg=THEME["success"])
+            def _revert_status():
+                try:
+                    if self.lbl_status and self.lbl_status.winfo_exists():
+                        self.lbl_status.config(text=orig_status, fg=orig_status_fg)
+                except Exception:
+                    pass
+            self.root.after(2000, _revert_status)
 
     def _save_host_password(self):
         new_pwd = self.entry_host_pwd.get().strip() if hasattr(self, "entry_host_pwd") else ""
@@ -667,7 +768,15 @@ class ClientViewerGUI:
             return
         self.security.set_password(new_pwd)
         self.entry_host_pwd.delete(0, tk.END)
-        messagebox.showinfo("Successo", "Password di accesso remoto salvata con successo!")
+        if hasattr(self, "btn_save_host_pwd") and self.btn_save_host_pwd:
+            orig_text = self.btn_save_host_pwd.cget("text")
+            self.btn_save_host_pwd.config(text="✓ Salvata!", bg=THEME["success"])
+            def _revert_pwd_btn():
+                try:
+                    self.btn_save_host_pwd.config(text=orig_text, bg=THEME["accent"])
+                except Exception:
+                    pass
+            self.root.after(1500, _revert_pwd_btn)
 
     def _toggle_host_daemon(self):
         if not self.host_daemon or not self.host_daemon.running:
@@ -771,6 +880,9 @@ class ClientViewerGUI:
             self.root.after(0, lambda: self.lbl_status.config(text=f"● {text}"))
         if self.viewer_window and tk.Toplevel.winfo_exists(self.viewer_window):
             self.root.after(0, lambda: self.viewer_window.title(f"AetherDesk - [{self.client.state.target_id}] - {text}"))
+            if "Password errata" in text:
+                self.root.after(0, lambda: messagebox.showerror("Disconnesso", text))
+                self.root.after(0, self._close_viewer)
 
     def _start_connect(self):
         raw_val = self.combo_id.get().strip()
@@ -795,6 +907,17 @@ class ClientViewerGUI:
             messagebox.showerror("Errore ID", "Inserisci un ID di 9 cifre (es. 482 910 234) oppure l'indirizzo IP del computer.")
             return
 
+        if not pwd:
+            local_pwd = self.security.get_password_display()
+            clean_own_id = self.security.get_or_create_device_id().replace(" ", "")
+            if dev_id.replace(" ", "") == clean_own_id or "127.0.0.1" in broker_url:
+                pwd = local_pwd
+                self.entry_pwd.delete(0, tk.END)
+                self.entry_pwd.insert(0, pwd)
+            else:
+                messagebox.showwarning("Password Richiesta", "Inserisci la password di accesso remoto del computer da controllare.")
+                return
+
         self.btn_connect.config(state="disabled", text="⏳  Connessione in corso...", bg="#0369a1")
         asyncio.run_coroutine_threadsafe(self._async_connect_task(dev_id, pwd, broker_url), self.loop)
         self.root.after(7000, self._ensure_connect_btn_reset)
@@ -816,6 +939,13 @@ class ClientViewerGUI:
             broker_url = self.entry_broker.get().strip()
             self.settings.save(dev_id, pwd, self.var_remember.get(), broker_url=broker_url)
             self._open_viewer_window()
+        else:
+            status_text = self.lbl_status.cget("text") if hasattr(self, "lbl_status") else ""
+            if "Password errata" in status_text or "Flusso non decifrabile" in status_text or "non valida" in status_text:
+                messagebox.showerror(
+                    "Autenticazione Fallita",
+                    "Password errata.\n\nVerifica la password configurata nel pannello Host del computer remoto (default: 123456) e riprova."
+                )
 
     def _switch_to_host_panel(self):
         self._switch_tab("host")
@@ -827,7 +957,7 @@ class ClientViewerGUI:
         self.viewer_window = tk.Toplevel(self.root)
         self.viewer_window.title(f"AetherDesk - [{self.client.state.target_id}]")
         self._center_window(self.viewer_window, 1280, 720)
-        self.viewer_window.configure(bg="#080a10")
+        self.viewer_window.configure(bg="#0c0d12")
         self.viewer_window.protocol("WM_DELETE_WINDOW", self._close_viewer)
 
         self.scale_mode = "fit"
@@ -835,23 +965,23 @@ class ClientViewerGUI:
         self._active_mon = -1
         self._active_quality = 65
 
-        # Floating notch to reveal toolbar when collapsed
-        self.notch_frame = tk.Frame(self.viewer_window, bg="#111422", height=26,
+        # Floating notch to reveal toolbar when collapsed (Apple Dynamic Island style)
+        self.notch_frame = tk.Frame(self.viewer_window, bg=THEME["toolbar_bg"], height=26,
                                     highlightthickness=1, highlightbackground=THEME["card_border"])
-        lbl_show = tk.Label(self.notch_frame, text="▼ Controlli Sessione (F11 / Ctrl+Alt+H)", bg="#111422", fg=THEME["cyan"],
+        lbl_show = tk.Label(self.notch_frame, text="▼ Controlli Sessione (F11 / Ctrl+Alt+H)", bg=THEME["toolbar_bg"], fg=THEME["cyan"],
                             font=("Segoe UI", 9, "bold"), cursor="hand2", padx=16, pady=3)
         lbl_show.pack(side=tk.TOP)
         lbl_show.bind("<Button-1>", lambda e: self._toggle_toolbar())
 
-        # Main Modern Floating Toolbar
-        self.toolbar = tk.Frame(self.viewer_window, bg="#111422", height=44, padx=12, pady=5)
+        # Main Modern Floating Toolbar (macOS Frosted Bar style)
+        self.toolbar = tk.Frame(self.viewer_window, bg=THEME["toolbar_bg"], height=44, padx=12, pady=5)
         self.toolbar.pack(fill=tk.X, side=tk.TOP)
 
         # Subtle bottom border line
         self.tb_border = tk.Frame(self.viewer_window, bg=THEME["card_border"], height=1)
         self.tb_border.pack(fill=tk.X, side=tk.TOP)
 
-        def _make_btn(parent, text, cmd, bg="#1b2032", fg=THEME["text_muted"], h_bg="#262d44", h_fg="#ffffff",
+        def _make_btn(parent, text, cmd, bg=THEME["card"], fg=THEME["text_muted"], h_bg=THEME["card_hover"], h_fg=THEME["text_main"],
                       font=("Segoe UI", 9), padx=8, pady=3, side=tk.LEFT):
             b = tk.Button(parent, text=text, bg=bg, fg=fg, relief="flat", activebackground=h_bg,
                           activeforeground=h_fg, font=font, cursor="hand2", padx=padx, pady=pady,
@@ -866,22 +996,22 @@ class ClientViewerGUI:
             return s
 
         # 1. Left Badge: LIVE Indicator + Target ID
-        badge_frame = tk.Frame(self.toolbar, bg="#161a29", padx=10, pady=3,
+        badge_frame = tk.Frame(self.toolbar, bg=THEME["card"], padx=10, pady=3,
                                highlightbackground=THEME["card_border"], highlightthickness=1)
         badge_frame.pack(side=tk.LEFT, padx=(0, 6))
 
-        lbl_dot = tk.Label(badge_frame, text="●", bg="#161a29", fg=THEME["success"], font=("Segoe UI", 10, "bold"))
+        lbl_dot = tk.Label(badge_frame, text="●", bg=THEME["card"], fg=THEME["success"], font=("Segoe UI", 10, "bold"))
         lbl_dot.pack(side=tk.LEFT, padx=(0, 5))
-        lbl_brand = tk.Label(badge_frame, text="LIVE", bg="#161a29", fg=THEME["cyan"], font=("Segoe UI", 9, "bold"))
+        lbl_brand = tk.Label(badge_frame, text="LIVE", bg=THEME["card"], fg=THEME["cyan"], font=("Segoe UI", 9, "bold"))
         lbl_brand.pack(side=tk.LEFT, padx=(0, 6))
-        lbl_tid = tk.Label(badge_frame, text=f"[{self.client.state.target_id}]", bg="#161a29",
+        lbl_tid = tk.Label(badge_frame, text=f"[{self.client.state.target_id}]", bg=THEME["card"],
                            fg=THEME["text_main"], font=("Consolas", 9, "bold"))
         lbl_tid.pack(side=tk.LEFT)
 
         _make_sep(self.toolbar)
 
-        # 2. System Commands Capsule (TeamViewer-grade Quick Actions)
-        actions_capsule = tk.Frame(self.toolbar, bg="#161a29", padx=3, pady=2,
+        # 2. System Commands Capsule (Apple macOS Control Center Quick Actions)
+        actions_capsule = tk.Frame(self.toolbar, bg=THEME["card"], padx=3, pady=2,
                                    highlightthickness=1, highlightbackground=THEME["card_border"])
         actions_capsule.pack(side=tk.LEFT, padx=3)
 
@@ -891,24 +1021,25 @@ class ClientViewerGUI:
         _make_btn(actions_capsule, "🔒 Blocca", lambda: self._send_special("lock"), padx=6)
         _make_btn(actions_capsule, "⚡ Ctrl+Alt+Del", lambda: self._send_special("ctrl_alt_del"), padx=6)
         _make_btn(actions_capsule, "📁 Invia File", self._pick_and_send_file,
-                  bg="#0c3a5c", fg=THEME["cyan"], h_bg="#0284c7", h_fg="#ffffff", padx=8)
+                  bg=THEME["card_hover"], fg=THEME["cyan"], h_bg=THEME["accent"], h_fg="#ffffff", padx=8)
 
         _make_sep(self.toolbar)
 
         # 3. Stream Controls Capsule (Monitor & Quality)
-        stream_capsule = tk.Frame(self.toolbar, bg="#161a29", padx=4, pady=2,
+        stream_capsule = tk.Frame(self.toolbar, bg=THEME["card"], padx=4, pady=2,
                                   highlightthickness=1, highlightbackground=THEME["card_border"])
         stream_capsule.pack(side=tk.LEFT, padx=3)
 
-        lbl_mon = tk.Label(stream_capsule, text="🖥", bg="#161a29", fg=THEME["text_dim"], font=("Segoe UI", 9))
+        lbl_mon = tk.Label(stream_capsule, text="🖥", bg=THEME["card"], fg=THEME["text_dim"], font=("Segoe UI", 9))
         lbl_mon.pack(side=tk.LEFT, padx=(2, 2))
 
         self.btn_m1 = _make_btn(stream_capsule, "1", lambda: self._on_switch_mon(0), padx=5, font=("Segoe UI", 8, "bold"))
         self.btn_m2 = _make_btn(stream_capsule, "2", lambda: self._on_switch_mon(1), padx=5, font=("Segoe UI", 8, "bold"))
         self.btn_mall = _make_btn(stream_capsule, "Tutti", lambda: self._on_switch_mon(-1), padx=5, font=("Segoe UI", 8, "bold"))
         self.btn_mall.config(bg=THEME["accent"], fg="#ffffff")
+        self.btn_mdual = _make_btn(stream_capsule, "🗔 2 Finestre", self._toggle_dual_window, padx=6, font=("Segoe UI", 8, "bold"))
 
-        lbl_sep_in = tk.Label(stream_capsule, text="•", bg="#161a29", fg=THEME["card_border"])
+        lbl_sep_in = tk.Label(stream_capsule, text="•", bg=THEME["card"], fg=THEME["card_border"])
         lbl_sep_in.pack(side=tk.LEFT, padx=3)
 
         self.btn_q_eco = _make_btn(stream_capsule, "Eco", lambda: self._on_select_quality(35), padx=5, font=("Segoe UI", 8))
@@ -925,12 +1056,12 @@ class ClientViewerGUI:
 
         # 6. OTA In-Place Update
         self.btn_ota = _make_btn(self.toolbar, "🔄 OTA", self._request_ota_update,
-                                 bg="#064e3b", fg="#6ee7b7", h_bg="#047857", h_fg="#ffffff", padx=6)
+                                 bg=THEME["success_bg"], fg=THEME["success"], h_bg=THEME["success"], h_fg="#ffffff", padx=6)
         if self.ota_update_available:
-            self.btn_ota.config(text=f"⚡ Aggiorna v{self.ota_remote_version}", bg="#059669", fg="#ffffff")
+            self.btn_ota.config(text=f"⚡ Aggiorna v{self.ota_remote_version}", bg=THEME["success"], fg="#ffffff")
 
         # Right side items
-        _make_btn(self.toolbar, "✕ Disconnetti", self._close_viewer, bg="#3b171f", fg="#f87171",
+        _make_btn(self.toolbar, "✕ Disconnetti", self._close_viewer, bg=THEME["danger_bg"], fg=THEME["danger"],
                   h_bg=THEME["danger"], h_fg="#ffffff", side=tk.RIGHT, padx=10, font=("Segoe UI", 9, "bold"))
 
         _make_btn(self.toolbar, "▲ Nascondi", self._toggle_toolbar, side=tk.RIGHT, padx=6, font=("Segoe UI", 8))
@@ -938,14 +1069,14 @@ class ClientViewerGUI:
         self.btn_fs = _make_btn(self.toolbar, "⛶ Schermo Intero", self._toggle_fullscreen, side=tk.RIGHT, padx=8)
 
         # Telemetry Pill (FPS + Encryption)
-        tele_frame = tk.Frame(self.toolbar, bg="#161a29", padx=8, pady=3,
+        tele_frame = tk.Frame(self.toolbar, bg=THEME["card"], padx=8, pady=3,
                               highlightbackground=THEME["card_border"], highlightthickness=1)
         tele_frame.pack(side=tk.RIGHT, padx=6)
 
-        self.lbl_fps = tk.Label(tele_frame, text="FPS: 0", bg="#161a29", fg=THEME["cyan"], font=("Consolas", 8, "bold"))
+        self.lbl_fps = tk.Label(tele_frame, text="FPS: 0", bg=THEME["card"], fg=THEME["cyan"], font=("Consolas", 8, "bold"))
         self.lbl_fps.pack(side=tk.LEFT, padx=(0, 6))
 
-        lbl_sec = tk.Label(tele_frame, text="🔒 AES-256", bg="#161a29", fg=THEME["text_dim"], font=("Segoe UI", 8))
+        lbl_sec = tk.Label(tele_frame, text="🔒 AES-256", bg=THEME["card"], fg=THEME["text_dim"], font=("Segoe UI", 8))
         lbl_sec.pack(side=tk.LEFT)
 
         # Video Canvas
@@ -1015,15 +1146,119 @@ class ClientViewerGUI:
     def _toggle_scale_mode(self):
         self.scale_mode = "1:1" if self.scale_mode == "fit" else "fit"
         txt = "🔍 1:1 Pixel" if self.scale_mode == "1:1" else "🔍 Adatta"
-        self.btn_scale.config(text=txt, bg=THEME["accent"] if self.scale_mode == "1:1" else "#1b2032",
+        self.btn_scale.config(text=txt, bg=THEME["accent"] if self.scale_mode == "1:1" else THEME["card"],
                               fg="#ffffff" if self.scale_mode == "1:1" else THEME["text_muted"])
 
     def _on_switch_mon(self, mon_id: int):
+        if self.dual_window_mode and mon_id != -1:
+            self._close_dual_window()
         self._active_mon = mon_id
         for m, btn in [(0, self.btn_m1), (1, self.btn_m2), (-1, self.btn_mall)]:
-            btn.config(bg=THEME["accent"] if m == mon_id else "#1b2032",
+            btn.config(bg=THEME["accent"] if m == mon_id else THEME["card"],
                        fg="#ffffff" if m == mon_id else THEME["text_muted"])
         self._switch_monitor(mon_id)
+
+    def _on_monitors_received(self, mons: list):
+        """Handle incoming list of active physical display monitors from host."""
+        self.remote_monitors = [m for m in mons if m.get("id", -1) >= 0]
+        def update_ui():
+            if hasattr(self, "btn_mdual") and self.btn_mdual:
+                if len(self.remote_monitors) >= 2:
+                    self.btn_mdual.config(text=f"🗔 2 Finestre ({len(self.remote_monitors)} Mon)", state=tk.NORMAL)
+                    self._on_status_update(f"Rilevati {len(self.remote_monitors)} monitor remoti! Puoi sdoppiarli in 2 finestre indipendenti.")
+        self.root.after(0, update_ui)
+
+    def _toggle_dual_window(self):
+        if not self.dual_window_mode:
+            self._open_dual_window()
+        else:
+            self._close_dual_window()
+
+    def _open_dual_window(self):
+        if self.dual_window_mode and self.viewer_window_m2:
+            return
+        self.dual_window_mode = True
+        if hasattr(self, "btn_mdual") and self.btn_mdual:
+            self.btn_mdual.config(bg=THEME["success"], fg="#ffffff")
+
+        # Stream all monitors combined from host
+        self._on_switch_mon(-1)
+
+        # Create TopLevel window for Screen 2
+        target_id = getattr(self.client.state, "target_id", "Remoto")
+        self.viewer_window_m2 = tk.Toplevel(self.root)
+        self.viewer_window_m2.title(f"AetherDesk - Schermo 2 [{target_id}]")
+        self.viewer_window_m2.geometry("1280x720")
+        self.viewer_window_m2.configure(bg=THEME["bg"])
+
+        # Secondary Window Toolbar
+        tb_m2 = tk.Frame(self.viewer_window_m2, bg=THEME["toolbar_bg"], height=36, padx=8, pady=4)
+        tb_m2.pack(fill=tk.X, side=tk.TOP)
+
+        lbl_b = tk.Label(tb_m2, text="🖥 SCHERMO 2", bg=THEME["card"], fg=THEME["cyan"],
+                         font=("Segoe UI", 9, "bold"), padx=8, pady=2)
+        lbl_b.pack(side=tk.LEFT, padx=(0, 6))
+
+        btn_fs_m2 = tk.Button(tb_m2, text="⛶ Schermo Intero (F11)", bg=THEME["card"], fg=THEME["text_muted"],
+                              activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
+                              relief="flat", cursor="hand2", padx=8, pady=2,
+                              command=self._toggle_fullscreen_m2)
+        btn_fs_m2.pack(side=tk.LEFT, padx=4)
+
+        btn_close_m2 = tk.Button(tb_m2, text="✕ Chiudi Schermo 2", bg=THEME["danger_bg"], fg=THEME["danger"],
+                                 activebackground=THEME["danger"], activeforeground="#ffffff",
+                                 font=("Segoe UI", 8, "bold"), relief="flat", cursor="hand2", padx=8, pady=2,
+                                 command=self._close_dual_window)
+        btn_close_m2.pack(side=tk.RIGHT, padx=4)
+
+        # Canvas for Screen 2
+        self.canvas_m2 = tk.Canvas(self.viewer_window_m2, bg="#080a10", highlightthickness=0)
+        self.canvas_m2.pack(fill=tk.BOTH, expand=True)
+
+        # Mouse & keyboard bindings for Screen 2
+        self.canvas_m2.bind("<Motion>", lambda e: self._on_mouse_move(e, mon_idx=1))
+        self.canvas_m2.bind("<B1-Motion>", lambda e: self._on_mouse_move(e, mon_idx=1))
+        self.canvas_m2.bind("<B2-Motion>", lambda e: self._on_mouse_move(e, mon_idx=1))
+        self.canvas_m2.bind("<B3-Motion>", lambda e: self._on_mouse_move(e, mon_idx=1))
+
+        self.canvas_m2.bind("<Button-1>", lambda e: self._on_mouse_btn(e, "left", "down", mon_idx=1))
+        self.canvas_m2.bind("<ButtonRelease-1>", lambda e: self._on_mouse_btn(e, "left", "up", mon_idx=1))
+        self.canvas_m2.bind("<Button-2>", lambda e: self._on_mouse_btn(e, "middle", "down", mon_idx=1))
+        self.canvas_m2.bind("<ButtonRelease-2>", lambda e: self._on_mouse_btn(e, "middle", "up", mon_idx=1))
+        self.canvas_m2.bind("<Button-3>", lambda e: self._on_mouse_btn(e, "right", "down", mon_idx=1))
+        self.canvas_m2.bind("<ButtonRelease-3>", lambda e: self._on_mouse_btn(e, "right", "up", mon_idx=1))
+        self.canvas_m2.bind("<MouseWheel>", lambda e: self._on_mouse_wheel(e, mon_idx=1))
+
+        self.viewer_window_m2.bind("<KeyPress>", self._on_key_press)
+        self.viewer_window_m2.bind("<KeyRelease>", self._on_key_release)
+        self.viewer_window_m2.bind("<Escape>", lambda e: self._on_escape_press_m2())
+        self.viewer_window_m2.bind("<F11>", lambda e: self._toggle_fullscreen_m2())
+        self.viewer_window_m2.protocol("WM_DELETE_WINDOW", self._close_dual_window)
+
+    def _toggle_fullscreen_m2(self):
+        if not self.viewer_window_m2:
+            return
+        is_fs = self.viewer_window_m2.attributes("-fullscreen")
+        self.viewer_window_m2.attributes("-fullscreen", not is_fs)
+
+    def _on_escape_press_m2(self):
+        if self.viewer_window_m2 and self.viewer_window_m2.attributes("-fullscreen"):
+            self.viewer_window_m2.attributes("-fullscreen", False)
+            return "break"
+
+    def _close_dual_window(self):
+        self.dual_window_mode = False
+        if hasattr(self, "btn_mdual") and self.btn_mdual:
+            self.btn_mdual.config(bg="#1b2032", fg=THEME["text_muted"])
+        if self.viewer_window_m2:
+            try:
+                self.viewer_window_m2.destroy()
+            except Exception:
+                pass
+            self.viewer_window_m2 = None
+            self.canvas_m2 = None
+            self._canvas_img_id_m2 = None
+            self.photo_img_m2 = None
 
     def _on_select_quality(self, quality: int):
         self._active_quality = quality
@@ -1321,6 +1556,7 @@ class ClientViewerGUI:
         self.root.after(1500, self._sync_clipboard_loop)
 
     def _close_viewer(self):
+        self._close_dual_window()
         asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
         self._canvas_img_id = None
         if self.viewer_window:
@@ -1330,10 +1566,11 @@ class ClientViewerGUI:
     def _set_quality(self, quality: int):
         asyncio.run_coroutine_threadsafe(self.client.set_quality(quality), self.loop)
 
-    def _on_frame_received(self, jpeg_bytes: bytes, dims: tuple[int, int], cur: tuple[int, int]):
+    def _on_frame_received(self, jpeg_bytes: bytes, dims: tuple[int, int], cur: tuple[int, int], *args):
         if not self.canvas:
             return
-        self._pending_frame = (jpeg_bytes, dims, cur)
+        telemetry = args[0] if args else {}
+        self._pending_frame = (jpeg_bytes, dims, cur, telemetry)
         if not self._render_scheduled:
             self._render_scheduled = True
             self.root.after(0, self._render_latest_frame)
@@ -1343,11 +1580,22 @@ class ClientViewerGUI:
         if not self.canvas or not getattr(self, "_pending_frame", None):
             return
 
-        jpeg_bytes, dims, cur = self._pending_frame
+        t_render_start = time.perf_counter_ns()
+        pending = self._pending_frame
+        jpeg_bytes, dims, cur = pending[0], pending[1], pending[2]
+        telemetry = pending[3] if len(pending) > 3 else {}
 
-        # Frame rate calculation
+        # Frame rate & latency calculation
         self._frame_count += 1
         now = time.time()
+        t_send = telemetry.get("t_send", 0.0) if isinstance(telemetry, dict) else 0.0
+        if t_send > 0:
+            e2e_ms = round((now - t_send) * 1000, 1)
+            if 0 <= e2e_ms < 5000:
+                self._latencies.append(e2e_ms)
+                if len(self._latencies) > 30:
+                    self._latencies.pop(0)
+
         elapsed = now - self._last_fps_time
         if elapsed >= 1.0:
             self._current_fps = int(self._frame_count / elapsed)
@@ -1355,34 +1603,142 @@ class ClientViewerGUI:
             self._last_fps_time = now
             if self.lbl_fps and self.viewer_window and tk.Toplevel.winfo_exists(self.viewer_window):
                 fps_val = self._current_fps
-                self.lbl_fps.config(text=f"FPS: {fps_val}")
+                avg_lat = round(sum(self._latencies) / len(self._latencies), 1) if self._latencies else 0.0
+                avg_rnd = round(sum(self._render_latencies) / len(self._render_latencies), 1) if self._render_latencies else 0.0
+                lat_str = f" | {avg_lat}ms" if avg_lat > 0 else ""
+                rnd_str = f" (gui {avg_rnd}ms)" if avg_rnd > 0 else ""
+                self.lbl_fps.config(text=f"FPS: {fps_val}{lat_str}{rnd_str}")
 
         try:
-            c_w = self.canvas.winfo_width()
-            c_h = self.canvas.winfo_height()
-            if c_w <= 10 or c_h <= 10:
-                c_w = max(self.viewer_window.winfo_width() if self.viewer_window else 1280, 1280)
-                c_h = max((self.viewer_window.winfo_height() - 44) if self.viewer_window else 720, 720)
+            raw_img = Image.open(io.BytesIO(jpeg_bytes))
+            full_w, full_h = raw_img.size
+            self._last_full_dims = (full_w, full_h)
 
-            img = Image.open(io.BytesIO(jpeg_bytes))
-            if getattr(self, "scale_mode", "fit") == "fit":
-                img.thumbnail((c_w, c_h), Image.Resampling.BILINEAR)
-            self.current_img_dims = img.size
-            photo = ImageTk.PhotoImage(img)
-            self.photo_img = photo
-            pos_x = (c_w - img.width) // 2
-            pos_y = (c_h - img.height) // 2
-            if self._canvas_img_id is None:
-                self.canvas.delete("loading")
-                self._canvas_img_id = self.canvas.create_image(pos_x, pos_y, anchor="nw", image=photo)
+            if self.dual_window_mode and self.viewer_window_m2 and tk.Toplevel.winfo_exists(self.viewer_window_m2):
+                if len(self.remote_monitors) >= 2:
+                    m1 = self.remote_monitors[0]
+                    m2 = self.remote_monitors[1]
+                    r1 = m1.get("rect", (0, 0, full_w // 2, full_h))
+                    r2 = m2.get("rect", (full_w // 2, 0, full_w, full_h))
+                    vx = min(r1[0], r2[0])
+                    vy = min(r1[1], r2[1])
+                    crop1 = (max(0, r1[0] - vx), max(0, r1[1] - vy), min(full_w, r1[2] - vx), min(full_h, r1[3] - vy))
+                    crop2 = (max(0, r2[0] - vx), max(0, r2[1] - vy), min(full_w, r2[2] - vx), min(full_h, r2[3] - vy))
+                else:
+                    half_w = full_w // 2
+                    crop1 = (0, 0, half_w, full_h)
+                    crop2 = (half_w, 0, full_w, full_h)
+
+                self._crop_m1 = crop1
+                self._crop_m2 = crop2
+
+                # 1. Render Screen 1 on Window 1 Canvas
+                c1_w = self.canvas.winfo_width()
+                c1_h = self.canvas.winfo_height()
+                if c1_w <= 10 or c1_h <= 10:
+                    c1_w = max(self.viewer_window.winfo_width() if self.viewer_window else 1280, 1280)
+                    c1_h = max((self.viewer_window.winfo_height() - 44) if self.viewer_window else 720, 720)
+
+                img1 = raw_img.crop(crop1)
+                if getattr(self, "scale_mode", "fit") == "fit":
+                    img1.thumbnail((c1_w, c1_h), Image.Resampling.BILINEAR)
+                self.current_img_dims = img1.size
+                photo1 = ImageTk.PhotoImage(img1)
+                self.photo_img = photo1
+                pos1_x = (c1_w - img1.width) // 2
+                pos1_y = (c1_h - img1.height) // 2
+                if self._canvas_img_id is None:
+                    self.canvas.delete("loading")
+                    self._canvas_img_id = self.canvas.create_image(pos1_x, pos1_y, anchor="nw", image=photo1)
+                else:
+                    self.canvas.coords(self._canvas_img_id, pos1_x, pos1_y)
+                    self.canvas.itemconfig(self._canvas_img_id, image=photo1)
+
+                # 2. Render Screen 2 on Window 2 Canvas
+                if self.canvas_m2 and self.viewer_window_m2 and tk.Toplevel.winfo_exists(self.viewer_window_m2):
+                    c2_w = self.canvas_m2.winfo_width()
+                    c2_h = self.canvas_m2.winfo_height()
+                    if c2_w <= 10 or c2_h <= 10:
+                        c2_w = max(self.viewer_window_m2.winfo_width() if self.viewer_window_m2 else 1280, 1280)
+                        c2_h = max((self.viewer_window_m2.winfo_height() - 40) if self.viewer_window_m2 else 720, 720)
+
+                    img2 = raw_img.crop(crop2)
+                    if getattr(self, "scale_mode", "fit") == "fit":
+                        img2.thumbnail((c2_w, c2_h), Image.Resampling.BILINEAR)
+                    self.current_img_dims_m2 = img2.size
+                    photo2 = ImageTk.PhotoImage(img2)
+                    self.photo_img_m2 = photo2
+                    pos2_x = (c2_w - img2.width) // 2
+                    pos2_y = (c2_h - img2.height) // 2
+                    if self._canvas_img_id_m2 is None:
+                        self.canvas_m2.delete("loading")
+                        self._canvas_img_id_m2 = self.canvas_m2.create_image(pos2_x, pos2_y, anchor="nw", image=photo2)
+                    else:
+                        self.canvas_m2.coords(self._canvas_img_id_m2, pos2_x, pos2_y)
+                        self.canvas_m2.itemconfig(self._canvas_img_id_m2, image=photo2)
             else:
-                self.canvas.coords(self._canvas_img_id, pos_x, pos_y)
-                self.canvas.itemconfig(self._canvas_img_id, image=photo)
+                c_w = self.canvas.winfo_width()
+                c_h = self.canvas.winfo_height()
+                if c_w <= 10 or c_h <= 10:
+                    c_w = max(self.viewer_window.winfo_width() if self.viewer_window else 1280, 1280)
+                    c_h = max((self.viewer_window.winfo_height() - 44) if self.viewer_window else 720, 720)
+
+                img = raw_img
+                if getattr(self, "scale_mode", "fit") == "fit":
+                    img.thumbnail((c_w, c_h), Image.Resampling.BILINEAR)
+                self.current_img_dims = img.size
+                photo = ImageTk.PhotoImage(img)
+                self.photo_img = photo
+                pos_x = (c_w - img.width) // 2
+                pos_y = (c_h - img.height) // 2
+                if self._canvas_img_id is None:
+                    self.canvas.delete("loading")
+                    self._canvas_img_id = self.canvas.create_image(pos_x, pos_y, anchor="nw", image=photo)
+                else:
+                    self.canvas.coords(self._canvas_img_id, pos_x, pos_y)
+                    self.canvas.itemconfig(self._canvas_img_id, image=photo)
+
+            t_render_ms = round((time.perf_counter_ns() - t_render_start) / 1e6, 2)
+            self._render_latencies.append(t_render_ms)
+            if len(self._render_latencies) > 30:
+                self._render_latencies.pop(0)
         except Exception as e:
             pass
 
-    def _calc_norm_coords(self, event) -> tuple[float, float]:
-        if not self.canvas or self.current_img_dims == (0, 0):
+    def _calc_norm_coords(self, event, mon_idx: int = 0) -> tuple[float, float]:
+        if not self.canvas:
+            return (0.0, 0.0)
+
+        # In dual window mode:
+        if self.dual_window_mode and self.viewer_window_m2:
+            target_canvas = self.canvas_m2 if mon_idx == 1 else self.canvas
+            target_dims = self.current_img_dims_m2 if mon_idx == 1 else self.current_img_dims
+            if not target_canvas or target_dims == (0, 0):
+                return (0.0, 0.0)
+
+            c_w = target_canvas.winfo_width()
+            c_h = target_canvas.winfo_height()
+            img_w, img_h = target_dims
+            offset_x = (c_w - img_w) / 2.0
+            offset_y = (c_h - img_h) / 2.0
+
+            rel_x = event.x - offset_x
+            rel_y = event.y - offset_y
+            local_nx = max(0.0, min(1.0, rel_x / img_w)) if img_w > 0 else 0.0
+            local_ny = max(0.0, min(1.0, rel_y / img_h)) if img_h > 0 else 0.0
+
+            full_w, full_h = getattr(self, "_last_full_dims", (1920, 1080))
+            crop_box = getattr(self, "_crop_m2" if mon_idx == 1 else "_crop_m1", (0, 0, full_w, full_h))
+            bx1, by1, bx2, by2 = crop_box
+            mon_w = max(1, bx2 - bx1)
+            mon_h = max(1, by2 - by1)
+
+            virt_x = bx1 + local_nx * mon_w
+            virt_y = by1 + local_ny * mon_h
+            return (max(0.0, min(1.0, virt_x / full_w)), max(0.0, min(1.0, virt_y / full_h)))
+
+        # Standard single window mode
+        if self.current_img_dims == (0, 0):
             return (0.0, 0.0)
         c_w = self.canvas.winfo_width()
         c_h = self.canvas.winfo_height()
@@ -1396,8 +1752,8 @@ class ClientViewerGUI:
         norm_y = max(0.0, min(1.0, rel_y / img_h)) if img_h > 0 else 0.0
         return (norm_x, norm_y)
 
-    def _on_mouse_move(self, event):
-        nx, ny = self._calc_norm_coords(event)
+    def _on_mouse_move(self, event, mon_idx: int = 0):
+        nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
         now = time.time()
         # High-performance rate limiting (50 Hz / 20ms) to eliminate WebSocket buffer saturation
         if now - getattr(self, "_last_mouse_send_time", 0.0) < 0.020:
@@ -1425,14 +1781,19 @@ class ClientViewerGUI:
                 self.loop
             )
 
-    def _on_mouse_btn(self, event, button: str, action: str):
-        if self.viewer_window:
+    def _on_mouse_btn(self, event, button: str, action: str, mon_idx: int = 0):
+        if mon_idx == 1 and self.viewer_window_m2:
+            try:
+                self.viewer_window_m2.focus_force()
+            except Exception:
+                pass
+        elif self.viewer_window:
             try:
                 self.viewer_window.focus_force()
             except Exception:
                 pass
         self._pending_mouse_coords = None
-        nx, ny = self._calc_norm_coords(event)
+        nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
         cmd = {
             "type": f"mouse_{action}",
             "button": button,
@@ -1444,8 +1805,8 @@ class ClientViewerGUI:
     def _on_double_click(self, event, button: str):
         pass
 
-    def _on_mouse_wheel(self, event):
-        nx, ny = self._calc_norm_coords(event)
+    def _on_mouse_wheel(self, event, mon_idx: int = 0):
+        nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
         delta = event.delta
         asyncio.run_coroutine_threadsafe(
             self.client.send_input({"type": "mouse_wheel", "delta": delta, "x": nx, "y": ny}),

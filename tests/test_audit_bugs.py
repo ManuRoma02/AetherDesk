@@ -96,3 +96,17 @@ def test_repro_client_viewer_gui_init():
     finally:
         gui.root.destroy()
 
+
+def test_security_manager_password_display(tmp_path):
+    """Verify SecurityManager provisions default password display and persists updates."""
+    sec = SecurityManager(config_dir=str(tmp_path))
+    pwd = sec.get_password_display()
+    assert pwd == "123456"
+    assert sec.verify_password("123456") is True
+
+    sec.set_password("CustomPass999")
+    assert sec.get_password_display() == "CustomPass999"
+    assert sec.verify_password("CustomPass999") is True
+    assert sec.verify_password("123456") is False
+
+

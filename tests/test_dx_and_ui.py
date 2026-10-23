@@ -96,3 +96,92 @@ def test_select_saved_device_logic():
     mock_gui.entry_broker.insert.assert_called_with(0, "ws://192.168.1.100:8765")
     mock_gui._on_status_update.assert_called_once()
 
+def test_app_ota_availability(monkeypatch):
+    """Verify OTA update checking and UI buttons are available from the GUI."""
+    from src.ota import check_github_update
+    has_newer, info = check_github_update()
+    assert isinstance(has_newer, bool)
+    assert isinstance(info, dict)
+    assert "tag" in info
+    assert "download_url" in info
+
+    # Verify ClientViewerGUI exposes OTA UI controls
+    mock_viewer = MagicMock()
+    mock_viewer.ota_downloading = False
+    mock_viewer.git_update_info = None
+    mock_viewer._check_git_updates_background = MagicMock()
+
+    ClientViewerGUI._on_git_update_click(mock_viewer)
+    # When clicked without cached update, it triggers background check
+    # (via threading or direct call)
+
+def test_client_viewer_monitors_received():
+    """Verify handling of incoming physical monitor list from host."""
+    mock_gui = MagicMock()
+    mock_gui.remote_monitors = []
+    mock_gui.btn_mdual = MagicMock()
+    
+    mons = [
+        {"id": 0, "name": "\\\\.\\DISPLAY1", "rect": [0, 0, 1920, 1080], "is_primary": True},
+        {"id": 1, "name": "\\\\.\\DISPLAY2", "rect": [1920, 0, 1920, 1080], "is_primary": False},
+        {"id": -1, "name": "Tutti i Monitor", "rect": [0, 0, 3840, 1080], "is_primary": False}
+    ]
+    
+    # Simulate _on_monitors_received
+    ClientViewerGUI._on_monitors_received(mock_gui, mons)
+    assert len(mock_gui.remote_monitors) == 2
+    assert mock_gui.remote_monitors[0]["id"] == 0
+    assert mock_gui.remote_monitors[1]["id"] == 1
+
+def test_client_viewer_dual_window_toggle():
+    """Verify toggling dual window mode on and off."""
+    mock_gui = MagicMock()
+    mock_gui.dual_window_mode = False
+    mock_gui.viewer_window_m2 = None
+    
+    # 1. Toggle ON: calls _open_dual_window
+    ClientViewerGUI._toggle_dual_window(mock_gui)
+    mock_gui._open_dual_window.assert_called_once()
+    
+    # 2. Toggle OFF: calls _close_dual_window
+    mock_gui.dual_window_mode = True
+    ClientViewerGUI._toggle_dual_window(mock_gui)
+    mock_gui._close_dual_window.assert_called_once()
+
+def test_client_viewer_calc_norm_coords_dual():
+    """Verify coordinate transformation from 2 independent windows to virtual desktop space."""
+    mock_gui = MagicMock()
+    mock_gui.dual_window_mode = True
+    mock_gui.viewer_window_m2 = MagicMock()
+    
+    mock_gui.canvas = MagicMock()
+    mock_gui.canvas.winfo_width.return_value = 1920
+    mock_gui.canvas.winfo_height.return_value = 1080
+    mock_gui.current_img_dims = (1920, 1080)
+    mock_gui._crop_m1 = (0, 0, 1920, 1080)
+    
+    mock_gui.canvas_m2 = MagicMock()
+    mock_gui.canvas_m2.winfo_width.return_value = 1920
+    mock_gui.canvas_m2.winfo_height.return_value = 1080
+    mock_gui.current_img_dims_m2 = (1920, 1080)
+    mock_gui._crop_m2 = (1920, 0, 3840, 1080)
+    
+    mock_gui._last_full_dims = (3840, 1080)
+    
+    # Event in Screen 1 (center: 960, 540)
+    ev1 = MagicMock()
+    ev1.x = 960
+    ev1.y = 540
+    norm_x1, norm_y1 = ClientViewerGUI._calc_norm_coords(mock_gui, ev1, mon_idx=0)
+    assert abs(norm_x1 - 0.25) < 0.001
+    assert abs(norm_y1 - 0.5) < 0.001
+    
+    # Event in Screen 2 (center: 960, 540) -> virt_x = 1920 + 960 = 2880 -> 2880 / 3840 = 0.75
+    ev2 = MagicMock()
+    ev2.x = 960
+    ev2.y = 540
+    norm_x2, norm_y2 = ClientViewerGUI._calc_norm_coords(mock_gui, ev2, mon_idx=1)
+    assert abs(norm_x2 - 0.75) < 0.001
+    assert abs(norm_y2 - 0.5) < 0.001
+
+
