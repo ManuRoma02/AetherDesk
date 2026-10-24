@@ -47,7 +47,7 @@ A restrained, high-density telepresence workspace fusing Apple Dark aesthetics w
 - **State Machine Transitions**: Connection stages (`DISCONNECTED` -> `NEGOTIATING` -> `AUTHENTICATING` -> `STREAMING`) reflected via color pips and status text.
 
 ## 7. Anti-Patterns (Banned)
-- NO emojis anywhere in the interface or branding.
+- NO decorative consumer emojis (smileys, reactions) anywhere in the interface or branding. Functional typographic unicode glyphs (such as arrows, status pips, and security shields) are permitted for compact operational buttons.
 - NO purple/neon gradients or cyber-synthwave aesthetics.
 - NO pure black (`#000000`) surfaces.
 - NO ambiguous rounded-blob illustrations.

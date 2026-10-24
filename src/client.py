@@ -24,8 +24,10 @@ class ClientSettings:
         if config_dir:
             self.config_dir = Path(config_dir)
         else:
-            appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
-            self.config_dir = Path(appdata) / "RemoteDesktopClient"
+            appdata = Path(os.environ.get("APPDATA", os.path.expanduser("~")))
+            legacy = appdata / "RemoteDesktopClient"
+            primary = appdata / "AetherDeskClient"
+            self.config_dir = legacy if legacy.exists() and not primary.exists() else primary
 
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.config_dir / "client_settings.json"
@@ -164,8 +166,9 @@ class ClientState:
 class RemoteClient:
     """Network client for connecting to a remote host via ID & password."""
 
-    def __init__(self, broker_url: str = "ws://127.0.0.1:8765"):
+    def __init__(self, broker_url: str = "ws://127.0.0.1:8765", auto_lan_discovery: bool = False):
         self.broker_url = broker_url
+        self.auto_lan_discovery = auto_lan_discovery
         self.state = ClientState()
         self.security = SecurityManager()
         self.clipboard = ClipboardManager()
@@ -214,8 +217,8 @@ class RemoteClient:
                 clean_brk = f"{clean_brk}:8765"
             self.broker_url = clean_brk
 
-        # 0b. Auto-resolve peer broker via LAN Discovery if still on default localhost
-        if not broker_url or "127.0.0.1" in self.broker_url or "localhost" in self.broker_url:
+        # 0b. Auto-resolve peer broker via LAN Discovery if enabled and no explicit broker passed
+        if getattr(self, "auto_lan_discovery", False) and not broker_url:
             try:
                 from src.discovery import get_discovery_listener
                 lan_broker = get_discovery_listener().get_peer_broker_url(clean_id)
@@ -260,6 +263,7 @@ class RemoteClient:
                 return False
 
             if msg_type == "HOST_FOUND":
+                self.security.reset_replay_window()
                 self._set_status("Computer trovato. Autenticazione...")
                 # Derive session key with entered password and host salt
                 host_salt_hex = payload.get("host_salt", "")
@@ -272,23 +276,24 @@ class RemoteClient:
                 auth_req = ProtocolMessage.serialize("AUTH_REQUEST", {"salt": salt.hex(), "target_id": clean_id}, binary_data=auth_token)
                 await self.websocket.send(auth_req)
 
-                # Validate host response or immediate first frame
+                # Validate host response (drain any stale in-flight messages until AUTH_OK or AUTH_FAILED)
                 try:
-                    auth_resp_raw = await asyncio.wait_for(self.websocket.recv(), timeout=3.5)
-                    auth_type, auth_payload, auth_bin = ProtocolMessage.deserialize(auth_resp_raw)
-                    if auth_type == "AUTH_FAILED":
-                        self.state.set_connecting(False)
-                        self._set_status("Password errata. Impossibile accedere all'host remoto.")
-                        await self.websocket.close()
-                        return False
-                    elif auth_type == "FRAME" and auth_bin:
-                        try:
-                            first_jpeg = self.security.decrypt_packet(auth_bin, session_key)
-                        except Exception:
+                    for _ in range(6):
+                        auth_resp_raw = await asyncio.wait_for(self.websocket.recv(), timeout=3.5)
+                        auth_type, auth_payload, auth_bin = ProtocolMessage.deserialize(auth_resp_raw)
+                        if auth_type == "AUTH_FAILED":
                             self.state.set_connecting(False)
-                            self._set_status("Password errata. Flusso non decifrabile.")
+                            self._set_status("Password errata. Impossibile accedere all'host remoto.")
                             await self.websocket.close()
                             return False
+                        elif auth_type == "AUTH_OK":
+                            break
+                        elif auth_type == "FRAME" and auth_bin:
+                            try:
+                                first_jpeg = self.security.decrypt_packet(auth_bin, session_key, check_replay=False)
+                                break
+                            except Exception:
+                                pass
                 except asyncio.TimeoutError:
                     pass
 
@@ -350,7 +355,7 @@ class RemoteClient:
                         asyncio.create_task(self.websocket.send(ack_msg))
 
                         t_dec_start = time.perf_counter_ns()
-                        jpeg_bytes = self.security.decrypt_packet(binary, self.state.session_key)
+                        jpeg_bytes = self.security.decrypt_packet(binary, self.state.session_key, check_replay=False)
                         t_dec_ms = round((time.perf_counter_ns() - t_dec_start) / 1e6, 2)
 
                         size = (payload.get("w", 1920), payload.get("h", 1080))
@@ -468,6 +473,14 @@ class RemoteClient:
                     if self.on_ota_complete_callback:
                         self.on_ota_complete_callback(False, err)
 
+                elif msg_type == "CLIENT_DISCONNECTED":
+                    logger.info("Host disconnected from broker.")
+                    self.state.set_connected(False)
+                    self._set_status("Il computer remoto si e' disconnesso.")
+                    if self.on_status_callback:
+                        self.on_status_callback("Il computer remoto si e' disconnesso.")
+                    break
+
         except (websockets.exceptions.ConnectionClosed, Exception) as e:
             logger.warning(f"Connection lost: {e}")
             if self.auto_reconnect and self.last_dev_id and not self.state.is_reconnecting:
@@ -582,7 +595,10 @@ class RemoteClient:
         """Ask host for available OTA updates."""
         if not self.state.is_connected or not self.websocket:
             return
-        msg = ProtocolMessage.serialize("OTA_CHECK", {"target_id": self.state.target_id})
+        msg = ProtocolMessage.serialize("OTA_CHECK", {
+            "target_id": self.state.target_id,
+            "client_version": get_app_version()
+        })
         try:
             await self.websocket.send(msg)
         except Exception as e:

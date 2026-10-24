@@ -30,12 +30,14 @@ class SignalingBroker:
         self.hosts[clean_id] = websocket
         self.host_salts[clean_id] = host_salt
 
-    def unregister_host(self, device_id: str):
+    def unregister_host(self, device_id: str, websocket=None):
         clean_id = device_id.replace(" ", "")
         if clean_id in self.hosts:
-            del self.hosts[clean_id]
+            if websocket is None or self.hosts[clean_id] == websocket:
+                del self.hosts[clean_id]
         if clean_id in self.host_salts:
-            del self.host_salts[clean_id]
+            if websocket is None or clean_id not in self.hosts:
+                del self.host_salts[clean_id]
 
     def get_host(self, device_id: str) -> Any:
         clean_id = device_id.replace(" ", "")
@@ -105,21 +107,28 @@ class SignalingBroker:
                         except Exception as e:
                             logger.warning(f"Failed to relay message to peer: {e}")
 
-        except websockets.exceptions.ConnectionClosed:
-            pass
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info(f"ConnectionClosed in handle_connection for role={role}, dev={device_id}: {e}")
+        except Exception as e:
+            logger.error(f"Unhandled exception in handle_connection for role={role}, dev={device_id}: {e}", exc_info=True)
         finally:
             if role == "host" and device_id:
-                self.unregister_host(device_id)
+                self.unregister_host(device_id, websocket)
             peer = self.routes.pop(websocket, None)
-            if peer and peer in self.routes:
+            if peer and self.routes.get(peer) == websocket:
                 del self.routes[peer]
+                try:
+                    asyncio.create_task(peer.send(ProtocolMessage.serialize("CLIENT_DISCONNECTED", {})))
+                except Exception:
+                    pass
 
     async def start(self):
         self.server = await websockets.serve(
             self.handle_connection,
             self.host,
             self.port,
-            max_size=16 * 1024 * 1024
+            max_size=16 * 1024 * 1024,
+            reuse_address=True
         )
         logger.info(f"Signaling broker listening on ws://{self.host}:{self.port}")
 

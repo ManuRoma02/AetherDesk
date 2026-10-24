@@ -83,8 +83,10 @@ class FileTransferManager:
         if save_dir:
             self.save_dir = Path(save_dir).resolve()
         else:
-            downloads = Path(os.environ.get("USERPROFILE", "C:\\")) / "Downloads" / "RemoteDesktop_Transfers"
-            self.save_dir = downloads.resolve()
+            downloads = Path(os.environ.get("USERPROFILE", "C:\\")) / "Downloads"
+            legacy_dir = downloads / "RemoteDesktop_Transfers"
+            primary_dir = downloads / "AetherDesk_Transfers"
+            self.save_dir = (legacy_dir if legacy_dir.exists() and not primary_dir.exists() else primary_dir).resolve()
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.incoming_transfers: Dict[str, Dict] = {} # file_id -> transfer state
@@ -184,3 +186,8 @@ class FileTransferManager:
             except Exception:
                 pass
             del self.incoming_transfers[file_id]
+
+    def cancel_all_transfers(self):
+        """Clean up and close all pending or aborted transfers."""
+        for file_id in list(self.incoming_transfers.keys()):
+            self.cancel_transfer(file_id)

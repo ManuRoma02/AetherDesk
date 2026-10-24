@@ -27,6 +27,7 @@ from src.security import SecurityManager
 from src.host_daemon import HostDaemon
 from src.signaling_broker import SignalingBroker
 from src.ota import (
+    CURRENT_VERSION,
     get_app_version,
     is_newer_version,
     validate_executable_file,
@@ -170,7 +171,7 @@ class ClientViewerGUI:
 
         self.settings = ClientSettings()
         initial_broker = self.settings.get_broker_url() if hasattr(self.settings, "get_broker_url") else broker_url
-        self.client = RemoteClient(broker_url=initial_broker)
+        self.client = RemoteClient(broker_url=initial_broker, auto_lan_discovery=True)
         self.client.on_frame_callback = self._on_frame_received
         self.client.on_status_callback = self._on_status_update
         self.client.on_ota_info_callback = self._on_ota_info
@@ -337,11 +338,6 @@ class ClientViewerGUI:
                              font=("Segoe UI", 15, "bold"))
         lbl_brand.pack(side=tk.LEFT)
 
-        lbl_ver_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg=THEME["card"], fg=THEME["text_muted"],
-                                 font=("Consolas", 8, "bold"), padx=6, pady=2,
-                                 highlightthickness=1, highlightbackground=THEME["card_border"])
-        lbl_ver_badge.pack(side=tk.LEFT, padx=(8, 0))
-
         self.btn_header_update = tk.Button(
             title_row, text="🔄 Aggiornamenti", bg=THEME["card"], fg=THEME["cyan"],
             activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
@@ -355,13 +351,13 @@ class ClientViewerGUI:
                            bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 9))
         lbl_sub.pack(anchor="w", pady=(2, 0))
 
-        # Segmented Control Pill [ 💻 Connetti | 🖥 Questo PC ] (Apple macOS HIG style)
+        # Segmented Control Pill [ 💻 Client | 🖥 Host ] (Apple macOS HIG style)
         tab_capsule = tk.Frame(header_bar, bg=THEME["tab_inactive_bg"], padx=3, pady=3,
                                highlightthickness=1, highlightbackground=THEME["card_border"])
         tab_capsule.pack(side=tk.RIGHT)
 
         self.btn_tab_client = tk.Button(
-            tab_capsule, text="💻 Connetti", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            tab_capsule, text="💻 Client", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
             padx=14, pady=4, highlightthickness=0,
             bg=THEME["tab_active_bg"] if self.active_tab == "client" else THEME["tab_inactive_bg"],
             fg=THEME["tab_active_fg"] if self.active_tab == "client" else THEME["tab_inactive_fg"],
@@ -370,7 +366,7 @@ class ClientViewerGUI:
         self.btn_tab_client.pack(side=tk.LEFT)
 
         self.btn_tab_host = tk.Button(
-            tab_capsule, text="🖥 Questo PC", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
+            tab_capsule, text="🖥 Host", font=("Segoe UI", 9, "bold"), relief="flat", cursor="hand2",
             padx=14, pady=4, highlightthickness=0,
             bg=THEME["tab_active_bg"] if self.active_tab == "host" else THEME["tab_inactive_bg"],
             fg=THEME["tab_active_fg"] if self.active_tab == "host" else THEME["tab_inactive_fg"],
@@ -394,7 +390,7 @@ class ClientViewerGUI:
         footer = tk.Frame(container, bg=THEME["bg"])
         footer.pack(fill=tk.X, pady=(12, 0))
 
-        lbl_foot_sec = tk.Label(footer, text="🔒 AES-256-GCM Zero-Knowledge • 60 FPS Engine",
+        lbl_foot_sec = tk.Label(footer, text=f"AetherDesk v{get_app_version()} • 🔒 AES-256-GCM Zero-Knowledge",
                                 bg=THEME["bg"], fg=THEME["text_dim"], font=("Segoe UI", 8))
         lbl_foot_sec.pack(side=tk.LEFT)
 
@@ -450,7 +446,8 @@ class ClientViewerGUI:
         device_options = [f"{d['id']} ({d.get('name', 'PC')})" for d in devices] if devices else []
         self.combo_id = ttk.Combobox(id_box, values=device_options, font=("Consolas", 13, "bold"), justify="left")
         self.combo_id.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
-        self.combo_id.set(saved_id if saved_id else "123 456 789")
+        default_id = saved_id if saved_id else self.security.get_or_create_device_id()
+        self.combo_id.set(default_id)
         self.combo_id.bind("<<ComboboxSelected>>", self._on_device_selected)
         self.combo_id.bind("<Return>", lambda e: self._start_connect())
         bind_focus_ring(self.combo_id, id_box)
@@ -789,6 +786,12 @@ class ClientViewerGUI:
                 self.lbl_host_status.config(text="● Servizio Host Attivo (In ascolto su porta 8765)", fg=THEME["success"])
         else:
             self.host_daemon.stop()
+            if hasattr(self, "host_broker") and self.host_broker:
+                try:
+                    asyncio.run(self.host_broker.stop())
+                except Exception:
+                    pass
+                self.host_broker = None
             if hasattr(self, "btn_host_toggle"):
                 self.btn_host_toggle.config(text="Avvia Demone", bg=THEME["accent"])
             if hasattr(self, "lbl_host_status"):
@@ -805,14 +808,20 @@ class ClientViewerGUI:
         asyncio.run(runner())
 
     def _open_firewall_unblock(self):
-        bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "allow_firewall.bat"))
+        base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        bat_path = os.path.join(base_dir, "scripts", "allow_firewall.bat")
+        if not os.path.exists(bat_path):
+            bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "allow_firewall.bat"))
         if os.path.exists(bat_path):
             os.startfile(bat_path)
         else:
             messagebox.showerror("Errore", f"File non trovato: {bat_path}")
 
     def _open_installer(self):
-        bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "install_service.bat"))
+        base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        bat_path = os.path.join(base_dir, "scripts", "install_service.bat")
+        if not os.path.exists(bat_path):
+            bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "install_service.bat"))
         if os.path.exists(bat_path):
             os.startfile(bat_path)
         else:
@@ -1054,11 +1063,14 @@ class ClientViewerGUI:
         self.privacy_on = False
         self.btn_privacy = _make_btn(self.toolbar, "🔒 Privacy", self._toggle_privacy, padx=7)
 
-        # 6. OTA In-Place Update
-        self.btn_ota = _make_btn(self.toolbar, "🔄 OTA", self._request_ota_update,
-                                 bg=THEME["success_bg"], fg=THEME["success"], h_bg=THEME["success"], h_fg="#ffffff", padx=6)
-        if self.ota_update_available:
-            self.btn_ota.config(text=f"⚡ Aggiorna v{self.ota_remote_version}", bg=THEME["success"], fg="#ffffff")
+        # 6. OTA In-Place Update (only visible if a newer version actually exists)
+        self.btn_ota = _make_btn(self.toolbar, f"✓ v{CURRENT_VERSION}", self._request_ota_update,
+                                 bg=THEME["card"], fg=THEME["text_muted"], h_bg=THEME["card_border"], h_fg="#ffffff", padx=6)
+        has_ota = self.ota_update_available and self.ota_remote_version and is_newer_version(self.ota_remote_version, CURRENT_VERSION)
+        if has_ota:
+            self.btn_ota.config(text=f"⚡ Aggiorna v{self.ota_remote_version}", bg=THEME["success"], fg="#ffffff", state=tk.NORMAL)
+        else:
+            self.btn_ota.config(text=f"✓ v{CURRENT_VERSION}", state=tk.DISABLED)
 
         # Right side items
         _make_btn(self.toolbar, "✕ Disconnetti", self._close_viewer, bg=THEME["danger_bg"], fg=THEME["danger"],
@@ -1478,8 +1490,12 @@ class ClientViewerGUI:
                             self.viewer_window.destroy()
                         except Exception:
                             pass
-                    self.root.destroy()
-                    sys.exit(0)
+                    try:
+                        self.root.destroy()
+                    except Exception:
+                        pass
+                    import os
+                    os._exit(0)
                 else:
                     messagebox.showerror("Errore Aggiornamento", app_msg)
                     if self.btn_header_update:
@@ -1506,8 +1522,9 @@ class ClientViewerGUI:
         asyncio.run_coroutine_threadsafe(self.client.request_ota_update(), self.loop)
 
     def _on_ota_info(self, payload: dict):
-        available = payload.get("available", False)
         remote_ver = payload.get("version", "")
+        # Only mark available if remote version is strictly newer than current installed version
+        available = payload.get("available", False) and bool(remote_ver and is_newer_version(remote_ver, CURRENT_VERSION))
         self.ota_remote_version = remote_ver
         self.ota_update_available = available
         def update_ui():
@@ -1515,6 +1532,9 @@ class ClientViewerGUI:
                 if self.btn_ota:
                     self.btn_ota.config(text=f"⚡ Aggiorna v{remote_ver}", bg="#059669", fg="#ffffff", state=tk.NORMAL)
                 self._on_status_update(f"Aggiornamento OTA disponibile: v{remote_ver}")
+            else:
+                if self.btn_ota:
+                    self.btn_ota.config(text=f"✓ v{CURRENT_VERSION}", bg="#1e293b", fg="#94a3b8", state=tk.DISABLED)
         self.root.after(0, update_ui)
 
     def _on_ota_progress(self, received: int, total: int):
@@ -1536,8 +1556,12 @@ class ClientViewerGUI:
                         self.viewer_window.destroy()
                     except Exception:
                         pass
-                self.root.destroy()
-                sys.exit(0)
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                import os
+                os._exit(0)
             else:
                 messagebox.showerror("Errore Aggiornamento OTA", f"Impossibile completare l'aggiornamento:\n{msg}")
                 if self.btn_ota:

@@ -70,8 +70,10 @@ class SecurityManager:
         if config_dir:
             self.config_dir = Path(config_dir)
         else:
-            prog_data = os.environ.get("ProgramData", "C:\\ProgramData")
-            self.config_dir = Path(prog_data) / "RemoteDesktop"
+            prog_data = Path(os.environ.get("ProgramData", "C:\\ProgramData"))
+            legacy = prog_data / "RemoteDesktop"
+            primary = prog_data / "AetherDesk"
+            self.config_dir = legacy if legacy.exists() and not primary.exists() else primary
 
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.config_dir / "config.json"

@@ -1,8 +1,29 @@
 import io
+import logging
 import ctypes
 from ctypes import wintypes
 from PIL import Image
 import win32api
+
+logger = logging.getLogger("DesktopCapture")
+
+def _ensure_interactive_desktop():
+    """Ensure calling thread is attached to the interactive WinSta0\\Default desktop."""
+    try:
+        user32 = ctypes.windll.user32
+        hwinsta = user32.OpenWindowStationW("WinSta0", False, 0x037F)
+        if hwinsta:
+            user32.SetProcessWindowStation(hwinsta)
+            user32.CloseWindowStation(hwinsta)
+        hdesk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+            user32.CloseDesktop(hdesk)
+    except Exception:
+        pass
+
+# Attach calling thread to interactive desktop before any subsystem initialization
+_ensure_interactive_desktop()
 
 try:
     import cv2
@@ -13,12 +34,11 @@ except ImportError:
     np = None
     HAS_CV2 = False
 
-try:
-    import dxcam
-    HAS_DXCAM = True
-except Exception:
-    dxcam = None
-    HAS_DXCAM = False
+# Lazy-loaded DXcam handle. Module-level import is intentionally omitted to prevent
+# DXGI adapter enumeration from attaching DirectX hooks to the calling thread,
+# which would cause subsequent Win32 SetThreadDesktop() calls to fail with ERROR_BUSY (170).
+HAS_DXCAM = False
+dxcam = None
 
 # Win32 Constants
 DESKTOP_READOBJECTS = 0x0001
@@ -26,6 +46,8 @@ DESKTOP_WRITEOBJECTS = 0x0080
 DESKTOP_SWITCHDESKTOP = 0x0100
 DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 SRCCOPY = 0x00CC0020
+CAPTUREBLT = 0x40000000
+BLT_ROP = SRCCOPY | CAPTUREBLT
 COLORONCOLOR = 3
 
 SM_XVIRTUALSCREEN = 76
@@ -80,9 +102,9 @@ class DesktopCapture:
                 pass
 
         self.current_desktop = None
+        self._current_desktop_name = ""
         self.current_monitor_id = 0
-        self.switch_desktop()
-
+        self._frame_count = 0
         self._src_dc = None
         self._mem_dc = None
         self._bitmap = None
@@ -92,26 +114,73 @@ class DesktopCapture:
         self._last_cursor = (0, 0)
         self._cached_mon_bounds = None
         self._cached_virt_bounds = None
+        self._dxcam = None
+
+        self.switch_desktop()
         self._bounds_cache_time = 0.0
 
         self._dxcam = None
         self._init_dxcam()
 
     def _init_dxcam(self):
-        """Try initializing DXGI Desktop Duplication engine via DXcam."""
-        if not HAS_DXCAM:
+        """Try initializing DXGI Desktop Duplication engine via DXcam if explicitly enabled and supported."""
+        import os
+        if os.environ.get("AETHER_ENABLE_DXCAM", "0") != "1":
+            # Disabled by default: GDI StretchBlt with CAPTUREBLT runs at 60+ FPS,
+            # fully supports desktop switching (UAC/lockscreen), and avoids
+            # DXGI_ERROR_ACCESS_DENIED (0x80070005) on hybrid GPU laptops.
             self._dxcam = None
             return
+
+        global dxcam, HAS_DXCAM
         try:
+            if dxcam is None:
+                import dxcam as _dxcam
+                dxcam = _dxcam
+                HAS_DXCAM = True
             out_idx = max(0, self.current_monitor_id)
             self._dxcam = dxcam.create(output_idx=out_idx)
+            # Verify grab actually works on active GPU (rejects hybrid GPU Access Denied)
+            test_f = self._dxcam.grab()
+            if test_f is None:
+                self._dxcam.release()
+                self._dxcam = None
         except Exception:
             self._dxcam = None
 
+    def _get_desktop_name(self, hdesk) -> str:
+        """Query Unicode name of desktop object via GetUserObjectInformationW."""
+        if not hdesk:
+            return ""
+        buf = ctypes.create_unicode_buffer(256)
+        if self.user32.GetUserObjectInformationW(hdesk, 2, buf, ctypes.sizeof(buf), None):
+            return buf.value
+        return ""
+
     def switch_desktop(self) -> bool:
-        """Switch current thread desktop to the active input desktop (handles UAC/lockscreen)."""
+        """Switch current thread desktop to the active input desktop (handles UAC/lockscreen/password screen)."""
+        try:
+            hwinsta = self.user32.OpenWindowStationW("WinSta0", False, 0x037F)
+            if hwinsta:
+                self.user32.SetProcessWindowStation(hwinsta)
+                self.user32.CloseWindowStation(hwinsta)
+        except Exception:
+            pass
+
         flags = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP
         hdesk = self.user32.OpenInputDesktop(0, False, flags)
+        if not hdesk:
+            hdesk = self.user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP)
+
+        desk_name = self._get_desktop_name(hdesk) if hdesk else ""
+        if not hdesk or "exebox" in desk_name.lower():
+            if hdesk:
+                try:
+                    self.user32.CloseDesktop(hdesk)
+                except Exception:
+                    pass
+            hdesk = self.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+
         if hdesk:
             res = self.user32.SetThreadDesktop(hdesk)
             if res:
@@ -121,6 +190,8 @@ class DesktopCapture:
                     except Exception:
                         pass
                 self.current_desktop = hdesk
+                self._current_desktop_name = self._get_desktop_name(hdesk)
+                self._cleanup_gdi()
                 return True
             else:
                 self.user32.CloseDesktop(hdesk)
@@ -233,6 +304,18 @@ class DesktopCapture:
 
     def capture_frame(self, only_if_changed: bool = False) -> tuple[bytes | None, tuple[int, int], tuple[int, int]]:
         """Capture the current frame, encode as JPEG, and return (jpeg_bytes, (screen_w, screen_h), (cur_x, cur_y))."""
+        self._frame_count += 1
+        if self._frame_count % 30 == 0:
+            try:
+                h_in = self.user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP)
+                if h_in:
+                    in_name = self._get_desktop_name(h_in)
+                    if in_name and in_name.lower() != self._current_desktop_name.lower():
+                        self.switch_desktop()
+                    self.user32.CloseDesktop(h_in)
+            except Exception:
+                pass
+
         src_x, src_y, screen_w, screen_h = self.get_active_monitor_bounds()
         cur_x, cur_y = self.get_cursor_position()
         cur_pos = (cur_x, cur_y)
@@ -247,6 +330,17 @@ class DesktopCapture:
                 # If frame is None and only_if_changed requested, DXGI indicates compositor has no dirty rects
                 if frame is None and only_if_changed and cur_pos == self._last_cursor and self._last_thumb is not None:
                     return (None, (screen_w, screen_h), cur_pos)
+
+                if frame is None:
+                    self._dxcam_none_count = getattr(self, "_dxcam_none_count", 0) + 1
+                    if self._dxcam_none_count > 3:
+                        try:
+                            self._dxcam.release()
+                        except Exception:
+                            pass
+                        self._dxcam = None
+                else:
+                    self._dxcam_none_count = 0
 
                 if frame is not None:
                     if frame.shape[2] == 4:
@@ -280,7 +374,7 @@ class DesktopCapture:
 
         # 2. GDI Fallback Path
         dims = (screen_w, screen_h, out_w, out_h)
-        if dims != self._last_dims:
+        if dims != self._last_dims or not self._src_dc or not self._mem_dc:
             self._cleanup_gdi()
             self._src_dc = self.user32.GetDC(0)
             self._mem_dc = self.gdi32.CreateCompatibleDC(self._src_dc)
@@ -290,11 +384,11 @@ class DesktopCapture:
             self._buffer = (ctypes.c_char * (out_w * out_h * 4))()
             self._last_dims = dims
 
-        # StretchBlt from screen to memory DC
+        # StretchBlt from screen to memory DC (with CAPTUREBLT for DWM hardware accelerated surfaces)
         blt_res = self.gdi32.StretchBlt(
             self._mem_dc, 0, 0, out_w, out_h,
             self._src_dc, src_x, src_y, screen_w, screen_h,
-            SRCCOPY
+            BLT_ROP
         )
 
         if not blt_res:
@@ -305,10 +399,12 @@ class DesktopCapture:
             self._bitmap = self.gdi32.CreateCompatibleBitmap(self._src_dc, out_w, out_h)
             self.gdi32.SelectObject(self._mem_dc, self._bitmap)
             self.gdi32.SetStretchBltMode(self._mem_dc, COLORONCOLOR)
+            self._buffer = (ctypes.c_char * (out_w * out_h * 4))()
+            self._last_dims = dims
             self.gdi32.StretchBlt(
                 self._mem_dc, 0, 0, out_w, out_h,
                 self._src_dc, src_x, src_y, screen_w, screen_h,
-                SRCCOPY
+                BLT_ROP
             )
 
         # Draw cursor into memory DC
@@ -347,6 +443,16 @@ class DesktopCapture:
             bgr = arr[:, :, :3]
 
             thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+
+            # Active black screen self-healing: if frame is completely black, re-sync desktop handle
+            if thumb.max() == 0 and not getattr(self, "_recovering_black", False):
+                self._recovering_black = True
+                self.switch_desktop()
+                self._cleanup_gdi()
+                recov_res = self.capture_frame(only_if_changed=False)
+                self._recovering_black = False
+                return recov_res
+
             if only_if_changed and self._last_thumb is not None:
                 is_same_thumb = False
                 if isinstance(self._last_thumb, np.ndarray):
@@ -370,6 +476,14 @@ class DesktopCapture:
             thumb = img.resize((160, 90), Image.Resampling.BILINEAR)
             thumb_bytes = thumb.tobytes()
 
+            if max(thumb_bytes) == 0 and not getattr(self, "_recovering_black", False):
+                self._recovering_black = True
+                self.switch_desktop()
+                self._cleanup_gdi()
+                recov_res = self.capture_frame(only_if_changed=False)
+                self._recovering_black = False
+                return recov_res
+
             if only_if_changed and self._last_thumb is not None:
                 is_same_thumb = False
                 if isinstance(self._last_thumb, bytes):
@@ -390,15 +504,26 @@ class DesktopCapture:
         return (jpeg_bytes, (screen_w, screen_h), cur_pos)
 
     def _cleanup_gdi(self):
-        if self._bitmap:
-            self.gdi32.DeleteObject(self._bitmap)
+        if getattr(self, "_bitmap", None):
+            try:
+                self.gdi32.DeleteObject(self._bitmap)
+            except Exception:
+                pass
             self._bitmap = None
-        if self._mem_dc:
-            self.gdi32.DeleteDC(self._mem_dc)
+        if getattr(self, "_mem_dc", None):
+            try:
+                self.gdi32.DeleteDC(self._mem_dc)
+            except Exception:
+                pass
             self._mem_dc = None
-        if self._src_dc:
-            self.user32.ReleaseDC(0, self._src_dc)
+        if getattr(self, "_src_dc", None):
+            try:
+                self.user32.ReleaseDC(0, self._src_dc)
+            except Exception:
+                pass
             self._src_dc = None
+        self._last_dims = (0, 0, 0, 0)
+        self._buffer = None
 
     def close(self):
         self._cleanup_gdi()

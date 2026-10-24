@@ -95,12 +95,25 @@ class InputHandler:
             except Exception:
                 pass
         self.last_pixel_pos = (0, 0)
+        self._winsta_initialized = False
 
     def _ensure_input_desktop(self) -> bool:
         """Attach caller thread to active Windows input desktop (handles UAC/lockscreen/worker threads)."""
+        if not self._winsta_initialized:
+            try:
+                hwinsta = self.user32.OpenWindowStationW("WinSta0", False, 0x037F)
+                if hwinsta:
+                    self.user32.SetProcessWindowStation(hwinsta)
+                    self._winsta_initialized = True
+            except Exception:
+                pass
+
         try:
-            # 0x01FF = GENERIC_ALL desktop access rights
-            hdesk = self.user32.OpenInputDesktop(0, False, 0x01FF)
+            # Safe explicit rights: READ + WRITE + SWITCH, fallback to READ + SWITCH
+            flags = 0x0001 | 0x0040 | 0x0100
+            hdesk = self.user32.OpenInputDesktop(0, False, flags)
+            if not hdesk:
+                hdesk = self.user32.OpenInputDesktop(0, False, 0x0001 | 0x0100)
             if hdesk:
                 res = self.user32.SetThreadDesktop(hdesk)
                 self.user32.CloseDesktop(hdesk)

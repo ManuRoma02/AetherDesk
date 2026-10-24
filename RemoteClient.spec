@@ -4,7 +4,7 @@ a = Analysis(
     ['src/client_viewer.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets', 'assets')],
+    datas=[('assets', 'assets'), ('scripts', 'scripts')],
     hiddenimports=[
         'PIL', 'PIL.Image', 'PIL.ImageTk', 'defusedxml', 'xml.etree.ElementTree',
         'cryptography', 'websockets', 'win32clipboard', 'src.ota',

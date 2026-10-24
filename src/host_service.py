@@ -9,7 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Setup logging to ProgramData
-log_dir = Path(os.environ.get("ProgramData", "C:\\ProgramData")) / "RemoteDesktop"
+prog_data = Path(os.environ.get("ProgramData", "C:\\ProgramData"))
+legacy_log = prog_data / "RemoteDesktop"
+primary_log = prog_data / "AetherDesk"
+log_dir = legacy_log if legacy_log.exists() and not primary_log.exists() else primary_log
 log_dir.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     filename=str(log_dir / "service.log"),

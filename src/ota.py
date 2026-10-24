@@ -13,7 +13,7 @@ from typing import Optional, Callable, Tuple
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.3.5"
+CURRENT_VERSION = "1.3.7"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 class OTAUpdateState(str, Enum):
@@ -74,9 +74,9 @@ def get_host_dist_executable() -> Optional[Path]:
         Path(__file__).resolve().parent.parent / "dist" / "RemoteClient.exe",
         Path(os.environ.get("USERPROFILE", "")) / "Downloads" / "AetherDesk.exe",
     ]
-    for p in candidates:
-        if p.exists() and p.is_file() and p.stat().st_size > 1_000_000:
-            return p
+    existing = [p for p in candidates if p.exists() and p.is_file() and p.stat().st_size > 1_000_000]
+    if existing:
+        return max(existing, key=lambda p: p.stat().st_mtime)
     return None
 
 def validate_executable_file(filepath: str | Path, expected_sha256: Optional[str] = None) -> Tuple[bool, str]:
@@ -239,32 +239,61 @@ def apply_in_place_update(
             pass
 
         # 3. Direct Silent Watchdog & Purge Process:
-        # Uses hidden PowerShell to wait until the current process exits (releasing all file locks),
-        # launches the new executable, and permanently purges .old and .exe.old backup files.
-        # Zero black CMD windows pop up, perfectly seamless for end users.
+        # Uses detached cmd / batch to reliably wait until the current process exits (releasing all file locks),
+        # launches the new executable with its original arguments in the interactive user desktop,
+        # and purges .old / .exe.old backup files.
         pid = os.getpid()
-        ps_cmd = (
-            f"try {{ Wait-Process -Id {pid} -Timeout 15 }} catch {{}}; "
-            f"Start-Sleep -Milliseconds 250; "
-            f"Start-Process -FilePath '{current_exe}'; "
-            f"Start-Sleep -Milliseconds 600; "
-            f"Remove-Item -Force -Path '{old_backup}', '{current_exe.parent}\\*.old', '{current_exe.parent}\\*.exe.old', '{current_exe.parent}\\*staging*' -ErrorAction SilentlyContinue"
+        args_list = [f'"{a}"' for a in sys.argv[1:]]
+        args_str = " ".join(args_list)
+
+        restart_bat = Path(tempfile.gettempdir()) / f"aether_restart_{pid}.bat"
+        bat_content = (
+            "@echo off\r\n"
+            f":wait_exit\r\n"
+            f"tasklist /fi \"PID eq {pid}\" /fo csv 2>nul | findstr /i \"\\\"{pid}\\\"\" >nul\r\n"
+            f"if not errorlevel 1 (\r\n"
+            f"    timeout /t 1 /nobreak >nul\r\n"
+            f"    goto wait_exit\r\n"
+            f")\r\n"
+            f"timeout /t 1 /nobreak >nul\r\n"
+            f"set _PYI_APPLICATION_HOME_DIR=\r\n"
+            f"set _PYI_ARCHIVE_FILE=\r\n"
+            f"set _PYI_PARENT_PROCESS_LEVEL=\r\n"
+            f"set _PYI_SPLASH_IPC=\r\n"
+            f"set _MEIPASS=\r\n"
+            f"set _MEIPASS2=\r\n"
+            f"set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
+            f"cd /d \"{current_exe.parent}\"\r\n"
+            f"start \"\" \"{current_exe}\" {args_str}\r\n"
+            f"timeout /t 2 /nobreak >nul\r\n"
+            f"del /f /q \"{old_backup}\" 2>nul\r\n"
+            f"del /f /q \"{current_exe.parent}\\*.old\" 2>nul\r\n"
+            f"del /f /q \"{current_exe.parent}\\*.exe.old\" 2>nul\r\n"
+            f"(goto) 2>nul & del \"%~f0\"\r\n"
         )
 
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0  # SW_HIDE (No console window)
-        creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-
         try:
+            restart_bat.write_text(bat_content, encoding="utf-8")
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE (No console window)
+            clean_env = os.environ.copy()
+            for var in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL", "_PYI_SPLASH_IPC", "_MEIPASS", "_MEIPASS2"):
+                clean_env.pop(var, None)
+            clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
             subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                ["cmd.exe", "/c", str(restart_bat)],
                 startupinfo=startupinfo,
-                creationflags=creationflags
+                creationflags=0x08000000 | 0x00000200,  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                close_fds=True,
+                env=clean_env
             )
         except Exception as ex_spawn:
-            logger.warning(f"Failed to spawn silent PowerShell updater, falling back to os.startfile: {ex_spawn}")
+            logger.warning(f"Failed to spawn restart batch watchdog, falling back to os.startfile: {ex_spawn}")
             try:
+                for var in ("_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL", "_PYI_SPLASH_IPC", "_MEIPASS", "_MEIPASS2"):
+                    os.environ.pop(var, None)
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
                 os.startfile(str(current_exe))
             except Exception:
                 pass

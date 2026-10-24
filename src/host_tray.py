@@ -172,11 +172,6 @@ class HostControlPanel:
                              font=("Segoe UI", 15, "bold"))
         lbl_brand.pack(side=tk.LEFT)
 
-        lbl_badge = tk.Label(title_row, text=f"v{get_app_version()}", bg=THEME["card"], fg=THEME["text_muted"],
-                             font=("Consolas", 8, "bold"), padx=6, pady=2,
-                             highlightthickness=1, highlightbackground=THEME["card_border"])
-        lbl_badge.pack(side=tk.LEFT, padx=(8, 0))
-
         self.btn_header_update = tk.Button(
             title_row, text="🔄 Aggiornamenti", bg=THEME["card"], fg=THEME["cyan"],
             activebackground=THEME["card_hover"], activeforeground="#ffffff", font=("Segoe UI", 8, "bold"),
@@ -429,7 +424,10 @@ class HostControlPanel:
         asyncio.run(runner())
 
     def _open_installer(self):
-        bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "install_service.bat"))
+        base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        bat_path = os.path.join(base_dir, "scripts", "install_service.bat")
+        if not os.path.exists(bat_path):
+            bat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts", "install_service.bat"))
         if os.path.exists(bat_path):
             os.startfile(bat_path)
         else:
@@ -554,7 +552,8 @@ class HostControlPanel:
                     self.root.destroy()
                 except Exception:
                     pass
-                sys.exit(0)
+                import os
+                os._exit(0)
             else:
                 self.root.after(0, lambda: messagebox.showerror("Errore Installazione", f"Impossibile applicare l'aggiornamento:\n{app_msg}"))
                 self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL) if self.btn_header_update else None)

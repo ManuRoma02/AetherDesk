@@ -15,12 +15,13 @@ import logging
 from typing import Dict, Any, Optional
 import websockets
 
-from src.capture import DesktopCapture
+from src.capture import DesktopCapture, _ensure_interactive_desktop
+_ensure_interactive_desktop()
 from src.input_handler import InputHandler
 from src.security import SecurityManager
 from src.protocol import ProtocolMessage
 from src.transfer import ClipboardManager, FileTransferManager
-from src.ota import get_app_version, compute_file_sha256, get_host_dist_executable
+from src.ota import get_app_version, compute_file_sha256, get_host_dist_executable, is_newer_version
 
 # Win32 Power Flags
 ES_CONTINUOUS = 0x80000000
@@ -50,6 +51,7 @@ class HostDaemon:
         self._frame_ack_event = asyncio.Event()
         self._frame_ack_event.set()
         self._in_flight_frame = False
+        self._streaming_active = False
 
     def prevent_sleep(self, enable: bool = True) -> bool:
         """Prevent Windows from sleeping or turning off the screen while unattended."""
@@ -93,25 +95,40 @@ class HostDaemon:
 
     def handle_client_message(self, msg_type: str, payload: dict, binary: Optional[bytes], session_state: dict) -> Optional[bytes]:
         """Process incoming client message, authenticate or execute input."""
+        client_ip = session_state.get("client_ip", "peer")
+
         if msg_type == "AUTH_REQUEST":
+            if self.security.is_rate_limited(client_ip):
+                return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Troppi tentativi falliti. Riprova tra 60 secondi."})
+
+            self.security.reset_replay_window()
             salt_hex = payload.get("salt", "")
             salt = bytes.fromhex(salt_hex) if salt_hex else b"salt"
-            master_hex = self.security.config.get("master_key", "")
-            if master_hex:
-                derived_key = self.security.derive_session_key(bytes.fromhex(master_hex), salt)
+            stored_master = self.security.get_master_key()
+            if stored_master:
+                derived_key = self.security.derive_session_key(stored_master, salt)
             else:
-                derived_key = self.security.derive_session_key("default_password", salt)
+                default_pwd = self.security.get_password_display()
+                derived_key = self.security.derive_session_key(default_pwd, salt)
 
-            if binary:
-                try:
-                    dec = self.security.decrypt_packet(binary, derived_key)
-                    if dec != b"AETHER_AUTH_V1":
-                        session_state["authenticated"] = False
-                        return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Credenziali non valide"})
-                except Exception:
+            if not binary:
+                self.security.record_failed_attempt(client_ip)
+                session_state["authenticated"] = False
+                return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Token di autenticazione mancante"})
+
+            try:
+                dec = self.security.decrypt_packet(binary, derived_key)
+                if dec != b"AETHER_AUTH_V1":
+                    self.security.record_failed_attempt(client_ip)
                     session_state["authenticated"] = False
-                    return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Password errata"})
+                    return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Credenziali non valide"})
+            except Exception:
+                self.security.record_failed_attempt(client_ip)
+                session_state["authenticated"] = False
+                return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Password errata"})
 
+            self.security.reset_attempts(client_ip)
+            self.security.reset_replay_window()
             session_state["session_key"] = derived_key
             session_state["authenticated"] = True
 
@@ -123,7 +140,12 @@ class HostDaemon:
             self._frame_ack_event.set()
             return None
 
-        elif msg_type == "INPUT":
+        # Guard all state-altering or information-disclosing commands behind authentication
+        if msg_type in ("INPUT", "CLIPBOARD", "SWITCH_MONITOR", "GET_MONITORS", "PRIVACY_MODE", "SET_QUALITY", "FILE_START", "FILE_CHUNK", "FILE_END"):
+            if not session_state.get("authenticated"):
+                return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Autenticazione richiesta"})
+
+        if msg_type == "INPUT":
             key = session_state.get("session_key")
             if not key or not binary:
                 return None
@@ -195,18 +217,21 @@ class HostDaemon:
             return ProtocolMessage.serialize("FILE_SAVED", {"status": "ok", "saved_path": saved})
 
         elif msg_type == "OTA_CHECK":
+            client_ver = payload.get("client_version", "")
             exe_path = get_host_dist_executable()
-            if exe_path and exe_path.exists():
+            current_ver = get_app_version()
+            has_newer = is_newer_version(current_ver, client_ver) if client_ver else False
+            if exe_path and exe_path.exists() and has_newer:
                 sha = compute_file_sha256(exe_path)
                 return ProtocolMessage.serialize("OTA_INFO", {
                     "available": True,
-                    "version": get_app_version(),
+                    "version": current_ver,
                     "filesize": exe_path.stat().st_size,
                     "sha256": sha
                 })
             return ProtocolMessage.serialize("OTA_INFO", {
                 "available": False,
-                "version": get_app_version()
+                "version": current_ver
             })
 
         return None
@@ -256,14 +281,16 @@ class HostDaemon:
         if not self.capture:
             self.capture = DesktopCapture(quality=55)
         else:
+            self.capture.switch_desktop()
             self.capture._last_thumb = None
 
         target_interval = 1.0 / 30.0 # 30 FPS target
         frame_counter = 0
         self._in_flight_frame = False
+        self._streaming_active = True
         self._frame_ack_event.set()
 
-        while self.running:
+        while self.running and self._streaming_active:
             # Check connection state across modern websockets versions
             ws_state = getattr(websocket, "state", None)
             if ws_state is not None and getattr(ws_state, "name", "") != "OPEN":
@@ -319,7 +346,7 @@ class HostDaemon:
                     self._frame_ack_event.clear()
                     await websocket.send(msg)
             except Exception as e:
-                logger.error(f"Capture error: {e}")
+                logger.error(f"Capture error in run_capture_stream: {e}")
                 break
 
             elapsed = time.time() - start_t
@@ -371,38 +398,48 @@ class HostDaemon:
                             raw = raw.encode("utf-8")
                         try:
                             msg_type, payload, binary = ProtocolMessage.deserialize(raw)
+                            logger.info(f"Host received message: {msg_type}")
                         except Exception as e:
                             logger.warning(f"Failed to deserialize message: {e}")
                             continue
 
                         if msg_type == "CLIENT_ARRIVED":
+                            self._streaming_active = False
+                            session_state.clear()
                             salt_hex = payload.get("salt", "")
-                            client_salt = bytes.fromhex(salt_hex) if salt_hex else b"salt"
-                            self.security._load_config()
-                            master_hex = self.security.config.get("master_key", "")
-                            if master_hex:
-                                master_key = bytes.fromhex(master_hex)
-                            else:
-                                master_key = self.security.derive_master_key("default_password", b"default_salt")
+                            session_state["client_salt"] = bytes.fromhex(salt_hex) if salt_hex else b"salt"
+                            session_state["client_ip"] = payload.get("client_id", "peer")
+                            logger.info(f"Client connected to broker, awaiting authentication...")
 
-                            session_key = self.security.derive_session_key(master_key, client_salt)
-                            session_state["session_key"] = session_key
-                            session_state["authenticated"] = True
-
-                            if stream_task and not stream_task.done():
-                                stream_task.cancel()
-                            stream_task = asyncio.create_task(self.run_capture_stream(ws, session_key))
+                        elif msg_type == "CLIENT_DISCONNECTED":
+                            self._streaming_active = False
+                            self.file_transfer.cancel_all_transfers()
+                            session_state.clear()
+                            logger.info("Client disconnected. Streaming halted.")
 
                         elif msg_type == "OTA_REQUEST":
+                            if not session_state.get("authenticated"):
+                                logger.warning("Richiesta OTA_REQUEST respinta: client non autenticato.")
+                                err_msg = ProtocolMessage.serialize("OTA_ERROR", {"error": "Autenticazione richiesta per scaricare l'aggiornamento."})
+                                await ws.send(err_msg)
+                                continue
                             asyncio.create_task(self._stream_ota_update(ws, session_state.get("session_key")))
 
                         else:
                             resp_bytes = self.handle_client_message(msg_type, payload, binary, session_state)
                             if resp_bytes:
                                 await ws.send(resp_bytes)
-                            if not session_state.get("authenticated", True):
+                            if msg_type == "AUTH_REQUEST" and session_state.get("authenticated"):
+                                self._streaming_active = False
                                 if stream_task and not stream_task.done():
-                                    stream_task.cancel()
+                                    try:
+                                        await asyncio.wait_for(stream_task, timeout=0.1)
+                                    except Exception:
+                                        pass
+                                self._streaming_active = True
+                                stream_task = asyncio.create_task(self.run_capture_stream(ws, session_state.get("session_key")))
+                            elif not session_state.get("authenticated", False):
+                                self._streaming_active = False
 
             except (websockets.exceptions.ConnectionClosed, OSError, Exception) as e:
                 logger.warning(f"Broker connection error: {e}. Retrying in 3s...")
@@ -416,6 +453,16 @@ class HostDaemon:
         self.running = True
         self.prevent_sleep(True)
         logger.info(f"Host Daemon started for Device ID: {self.device_id}")
+
+        # If broker target is default loopback and port 8765 is not yet open, run embedded broker
+        if "127.0.0.1:8765" in self.broker_url or "localhost:8765" in self.broker_url:
+            try:
+                from src.signaling_broker import SignalingBroker
+                self._embedded_broker = SignalingBroker(host="0.0.0.0", port=8765)
+                await self._embedded_broker.start()
+                logger.info("Embedded Signaling Broker started on port 8765")
+            except Exception:
+                self._embedded_broker = None
 
         # Start LAN UDP discovery beacon so clients on same Wi-Fi/LAN find this host automatically
         try:
@@ -440,6 +487,12 @@ class HostDaemon:
             except Exception:
                 pass
             self._broadcaster = None
+        if hasattr(self, "_embedded_broker") and self._embedded_broker:
+            try:
+                asyncio.run(self._embedded_broker.stop())
+            except Exception:
+                pass
+            self._embedded_broker = None
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
         if self.capture:
@@ -471,9 +524,10 @@ Examples:
         sec = SecurityManager(config_dir=args.config_dir)
         d_id = sec.get_or_create_device_id()
         has_pwd = bool(sec.config.get("pwd_hash"))
+        def_pwd = sec.get_password_display()
         print(f"AetherDesk Host Status:")
         print(f"  Device ID: {d_id}")
-        print(f"  Password configured: {'Yes' if has_pwd else 'No (Default: default_password)'}")
+        print(f"  Password configured: {'Yes' if has_pwd else f'No (Default: {def_pwd})'}")
         print(f"  Broker target: {args.broker}")
         sys.exit(0)
 

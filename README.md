@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/tests-38%2F38%20passing-10b981?style=flat-square" alt="Tests 38/38 Passing"/>
+  <img src="https://img.shields.io/badge/tests-75%2F75%20passing-10b981?style=flat-square" alt="Tests 75/75 Passing"/>
   <img src="https://img.shields.io/badge/encryption-AES--256--GCM-38bdf8?style=flat-square" alt="E2EE Encryption"/>
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011%20x64-6366f1?style=flat-square" alt="Windows"/>
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License MIT"/>
@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://github.com/ManuRoma02/AetherDesk/releases/latest/download/AetherDesk.exe">
-    <img src="https://img.shields.io/badge/Download-AetherDesk.exe%20(v1.2.0)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download AetherDesk.exe"/>
+    <img src="https://img.shields.io/badge/Download-AetherDesk.exe%20(v1.3.7)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download AetherDesk.exe"/>
   </a>
 </p>
 
