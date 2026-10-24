@@ -16,7 +16,7 @@
 
 <p align="center">
   <a href="https://github.com/ManuRoma02/AetherDesk/releases/latest/download/AetherDesk.exe">
-    <img src="https://img.shields.io/badge/Download-AetherDesk.exe%20(v1.3.8)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download AetherDesk.exe"/>
+    <img src="https://img.shields.io/badge/Download-AetherDesk.exe%20(v1.3.9)-2563eb?style=for-the-badge&logo=windows&logoColor=white" alt="Download AetherDesk.exe"/>
   </a>
 </p>
 

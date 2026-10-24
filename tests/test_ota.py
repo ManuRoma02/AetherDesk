@@ -28,17 +28,17 @@ def test_ota_states():
     assert OTAUpdateState.TESTING == "TESTING"
 
 def test_version_helpers():
-    assert get_app_version() == "1.3.8"
-    assert parse_version("1.3.8") == (1, 3, 8)
+    assert get_app_version() == "1.3.9"
+    assert parse_version("1.3.9") == (1, 3, 9)
     assert parse_version("1.3") == (1, 3, 0)
     assert parse_version("v1.4.2") == (1, 4, 2)
-    assert parse_version("1.3.8.1") == (1, 3, 8, 1)
-    assert is_newer_version("1.3.9", "1.3.8") is True
-    assert is_newer_version("1.4", "1.3.8") is True
-    assert is_newer_version("2.0.0", "1.3.8") is True
-    assert is_newer_version("1.3.8", "1.3.8") is False
-    assert is_newer_version("1.3", "1.3.8") is False
-    assert is_newer_version("1.3.7", "1.3.8") is False
+    assert parse_version("1.3.9.1") == (1, 3, 9, 1)
+    assert is_newer_version("1.3.10", "1.3.9") is True
+    assert is_newer_version("1.4", "1.3.9") is True
+    assert is_newer_version("2.0.0", "1.3.9") is True
+    assert is_newer_version("1.3.9", "1.3.9") is False
+    assert is_newer_version("1.3", "1.3.9") is False
+    assert is_newer_version("1.3.8", "1.3.9") is False
 
 def test_verify_update_manifest():
     # Valid manifest

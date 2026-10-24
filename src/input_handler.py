@@ -131,9 +131,16 @@ class InputHandler:
                 pass
         self.last_pixel_pos = (0, 0)
         self._winsta_initialized = False
+        self._last_desktop_check = 0.0
+        self._pressed_keys = set()
 
-    def _ensure_input_desktop(self) -> bool:
+    def _ensure_input_desktop(self, force: bool = False) -> bool:
         """Attach caller thread to active Windows input desktop (handles UAC/lockscreen/worker threads)."""
+        now = time.time()
+        if not force and (now - self._last_desktop_check < 2.0):
+            return True
+        self._last_desktop_check = now
+
         if not self._winsta_initialized:
             try:
                 hwinsta = self.user32.OpenWindowStationW("WinSta0", False, 0x037F)
@@ -176,8 +183,11 @@ class InputHandler:
         return (max(0, min(w - 1, x)), max(0, min(h - 1, y)))
 
     def _send_input(self, inp: INPUT) -> bool:
-        self._ensure_input_desktop()
         res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if res == 0:
+            # SendInput failed, try re-attaching thread to active input desktop (e.g. UAC or lock screen)
+            self._ensure_input_desktop(force=True)
+            res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
         return res > 0
 
     def _calc_coords(self, norm_x: float, norm_y: float,
@@ -222,12 +232,15 @@ class InputHandler:
 
     def move_mouse_relative(self, dx: float, dy: float) -> tuple[int, int]:
         """Move cursor relatively (for virtual trackpad / relative mouse mode)."""
-        self._ensure_input_desktop()
         pos = ctypes.wintypes.POINT()
-        self.user32.GetCursorPos(ctypes.byref(pos))
+        if not self.user32.GetCursorPos(ctypes.byref(pos)):
+            self._ensure_input_desktop(force=True)
+            self.user32.GetCursorPos(ctypes.byref(pos))
         new_x = pos.x + int(dx)
         new_y = pos.y + int(dy)
-        self.user32.SetCursorPos(new_x, new_y)
+        if not self.user32.SetCursorPos(new_x, new_y):
+            self._ensure_input_desktop(force=True)
+            self.user32.SetCursorPos(new_x, new_y)
         self.last_pixel_pos = (new_x, new_y)
         return (new_x, new_y)
 
@@ -235,12 +248,13 @@ class InputHandler:
                    monitor_bounds: tuple[int, int, int, int] = None,
                    virtual_bounds: tuple[int, int, int, int] = None) -> tuple[int, int]:
         """Move cursor using physical SetCursorPos and SendInput virtual desk coordinates."""
-        self._ensure_input_desktop()
         pixel_x, pixel_y, abs_x, abs_y = self._calc_coords(norm_x, norm_y, monitor_bounds, virtual_bounds)
         self.last_pixel_pos = (pixel_x, pixel_y)
 
         # 1. Direct hardware/OS pixel positioning
-        self.user32.SetCursorPos(pixel_x, pixel_y)
+        if not self.user32.SetCursorPos(pixel_x, pixel_y):
+            self._ensure_input_desktop(force=True)
+            self.user32.SetCursorPos(pixel_x, pixel_y)
 
         # 2. Virtual desktop coordinate injection
         inp = INPUT()
@@ -248,6 +262,8 @@ class InputHandler:
         inp.union.mi.dx = abs_x
         inp.union.mi.dy = abs_y
         inp.union.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+        self._send_input(inp)
+        return (pixel_x, pixel_y)
 
         if not self._send_input(inp):
             self.user32.mouse_event(
@@ -359,7 +375,7 @@ class InputHandler:
             self.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
 
     def key_down(self, vk_code: int):
-        self._ensure_input_desktop()
+        self._pressed_keys.add(vk_code)
         flags = KEYEVENTF_KEYDOWN
         if vk_code in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C):
             flags |= KEYEVENTF_EXTENDEDKEY
@@ -372,7 +388,7 @@ class InputHandler:
             self.user32.keybd_event(vk_code, 0, flags, 0)
 
     def key_up(self, vk_code: int):
-        self._ensure_input_desktop()
+        self._pressed_keys.discard(vk_code)
         flags = KEYEVENTF_KEYUP
         if vk_code in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C):
             flags |= KEYEVENTF_EXTENDEDKEY
@@ -383,6 +399,23 @@ class InputHandler:
         inp.union.ki.dwFlags = flags
         if not self._send_input(inp):
             self.user32.keybd_event(vk_code, 0, flags, 0)
+
+    def release_all_keys(self):
+        """Release all currently pressed keys to avoid stuck modifiers or letters."""
+        for vk in list(self._pressed_keys):
+            self.key_up(vk)
+        self._pressed_keys.clear()
+        # Explicitly ensure common modifiers are released
+        for mod in (0x11, 0x12, 0x10, 0x5B, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+            flags = KEYEVENTF_KEYUP
+            if mod in (0x5B, 0xA2, 0xA3, 0xA4, 0xA5):
+                flags |= KEYEVENTF_EXTENDEDKEY
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.union.ki.wVk = mod
+            inp.union.ki.dwFlags = flags
+            if not self._send_input(inp):
+                self.user32.keybd_event(mod, 0, flags, 0)
 
     def send_unicode_char(self, char_or_text: str):
         """Send unicode character or full text string directly (immune to layout differences)."""

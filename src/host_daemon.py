@@ -365,7 +365,7 @@ class HostDaemon:
             # Adaptive Backpressure: if previous frame hasn't been ACKed, wait briefly or skip frame
             if self._in_flight_frame:
                 try:
-                    await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.08)
+                    await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.12)
                 except asyncio.TimeoutError:
                     pass
                 finally:
@@ -375,8 +375,8 @@ class HostDaemon:
             start_t = time.time()
             t_cap_start = time.perf_counter_ns()
             try:
-                # Check clipboard change throttled to once per second (every 30 frames) to eliminate lock contention
-                if frame_counter % 30 == 0:
+                # Fast sequence-number check for clipboard changes (zero-lock O(1))
+                if frame_counter % 10 == 0:
                     try:
                         if self.clipboard.has_changed():
                             clip_text = self.clipboard.get_text()
@@ -467,7 +467,10 @@ class HostDaemon:
                             raw = raw.encode("utf-8")
                         try:
                             msg_type, payload, binary = ProtocolMessage.deserialize(raw)
-                            logger.info(f"Host received message: {msg_type}")
+                            if msg_type != "INPUT":
+                                logger.info(f"Host received message: {msg_type}")
+                            else:
+                                logger.debug(f"Host received message: {msg_type}")
                         except Exception as e:
                             logger.warning(f"Failed to deserialize message: {e}")
                             continue
@@ -483,6 +486,7 @@ class HostDaemon:
                         elif msg_type == "CLIENT_DISCONNECTED":
                             self._streaming_active = False
                             self.file_transfer.cancel_all_transfers()
+                            self.input_handler.release_all_keys()
                             session_state.clear()
                             logger.info("Client disconnected. Streaming halted.")
 

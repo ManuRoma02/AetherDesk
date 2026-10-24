@@ -268,6 +268,7 @@ class DesktopCapture:
         else:
             res = (vx, vy, vw, vh)
         self._cached_virt_bounds = res
+        self._bounds_cache_time = now
         return res
 
     def get_active_monitor_bounds(self) -> tuple[int, int, int, int]:
@@ -351,8 +352,8 @@ class DesktopCapture:
                     if (out_w, out_h) != (bgr.shape[1], bgr.shape[0]):
                         bgr = cv2.resize(bgr, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-                    # High-fidelity change detection (160x90 INTER_AREA)
-                    thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+                    # High-fidelity change detection (160x90 INTER_NEAREST)
+                    thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_NEAREST)
                     if only_if_changed and self._last_thumb is not None:
                         is_same = False
                         if isinstance(self._last_thumb, np.ndarray):

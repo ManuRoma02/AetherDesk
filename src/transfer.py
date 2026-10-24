@@ -1,16 +1,25 @@
 import os
 import time
 import secrets
+import ctypes
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 import win32clipboard
 
 class ClipboardManager:
-    """Manages Windows clipboard reading, writing and change detection."""
+    """
+    Manages Windows clipboard reading, writing and change detection.
+    Uses GetClipboardSequenceNumber for zero-lock, O(1) change detection.
+    """
 
     def __init__(self):
         self.last_text = ""
         self._fallback_text = ""
+        self._last_seq = 0
+        try:
+            self._last_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+        except Exception:
+            pass
 
     def get_text(self) -> str:
         text = ""
@@ -67,9 +76,22 @@ class ClipboardManager:
                 time.sleep(0.02)
         if update_last:
             self.last_text = text
+            try:
+                self._last_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+            except Exception:
+                pass
         return True
 
     def has_changed(self) -> bool:
+        # Fast path: check Windows clipboard sequence number without locking
+        try:
+            seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+            if seq != 0 and seq == self._last_seq:
+                return False
+            self._last_seq = seq
+        except Exception:
+            pass
+
         current = self.get_text()
         if current and current != self.last_text:
             self.last_text = current

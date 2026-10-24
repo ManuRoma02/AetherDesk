@@ -88,3 +88,12 @@ def test_input_handler_multimonitor_mapping():
     assert abs(abs_x - int(0.75 * 65535)) <= 1
     # Center in height is 50% (0.5 * 65535 = 32767)
     assert abs(abs_y - int(0.5 * 65535)) <= 1
+
+def test_input_handler_release_all_keys():
+    handler = InputHandler()
+    handler.key_down(0x41)
+    handler.key_down(0x11) # Ctrl
+    assert 0x41 in handler._pressed_keys
+    assert 0x11 in handler._pressed_keys
+    handler.release_all_keys()
+    assert len(handler._pressed_keys) == 0
