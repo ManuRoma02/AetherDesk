@@ -442,7 +442,7 @@ class DesktopCapture:
             arr = np.frombuffer(self._buffer, dtype=np.uint8).reshape((out_h, out_w, 4))
             bgr = arr[:, :, :3]
 
-            thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+            thumb = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_NEAREST)
 
             # Active black screen self-healing: if frame is completely black, re-sync desktop handle
             if thumb.max() == 0 and not getattr(self, "_recovering_black", False):
@@ -472,8 +472,8 @@ class DesktopCapture:
             jpeg_bytes = enc.tobytes() if success else b""
         else:
             # Native Pillow fallback (zero C-extension dependency, bundled in standalone binary)
-            img = Image.frombuffer("RGBA", (out_w, out_h), self._buffer, "raw", "BGRA", 0, 1)
-            thumb = img.resize((160, 90), Image.Resampling.BILINEAR)
+            img = Image.frombuffer("RGB", (out_w, out_h), self._buffer, "raw", "BGRX", 0, 1)
+            thumb = img.resize((160, 90), Image.Resampling.NEAREST)
             thumb_bytes = thumb.tobytes()
 
             if max(thumb_bytes) == 0 and not getattr(self, "_recovering_black", False):
@@ -498,7 +498,7 @@ class DesktopCapture:
             self._last_cursor = cur_pos
 
             bio = io.BytesIO()
-            img.convert("RGB").save(bio, format="JPEG", quality=self.quality, subsampling=2, optimize=False)
+            img.save(bio, format="JPEG", quality=self.quality, subsampling=2, optimize=False)
             jpeg_bytes = bio.getvalue()
 
         return (jpeg_bytes, (screen_w, screen_h), cur_pos)

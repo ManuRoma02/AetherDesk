@@ -147,27 +147,37 @@ class HostDaemon:
 
         if msg_type == "INPUT":
             key = session_state.get("session_key")
-            if not key or not binary:
-                return None
-            try:
-                decrypted = self.security.decrypt_packet(binary, key)
-                cmd = json.loads(decrypted.decode("utf-8"))
-                self._execute_input(cmd)
-                return ProtocolMessage.serialize("ACK", {"status": "ok"})
-            except Exception as e:
-                logger.error(f"Failed to decrypt/execute input: {e}")
-                return None
-
-        elif msg_type == "CLIPBOARD":
-            key = session_state.get("session_key")
+            cmd = None
             if key and binary:
                 try:
                     decrypted = self.security.decrypt_packet(binary, key)
-                    text = decrypted.decode("utf-8")
-                    self.clipboard.set_text(text, update_last=True)
-                    return ProtocolMessage.serialize("ACK", {"status": "clipboard_set"})
+                    cmd = json.loads(decrypted.decode("utf-8"))
                 except Exception as e:
-                    logger.error(f"Clipboard sync error: {e}")
+                    logger.error(f"Failed to decrypt input packet: {e}")
+                    return None
+            elif payload and "cmd" in payload:
+                cmd = payload["cmd"]
+            elif payload and "type" in payload:
+                cmd = payload
+
+            if cmd:
+                self._execute_input(cmd)
+                return ProtocolMessage.serialize("ACK", {"status": "ok"})
+            return None
+
+        elif msg_type == "CLIPBOARD":
+            key = session_state.get("session_key")
+            text = payload.get("text") or payload.get("data")
+            if not text and key and binary:
+                try:
+                    decrypted = self.security.decrypt_packet(binary, key)
+                    text = decrypted.decode("utf-8")
+                except Exception as e:
+                    logger.error(f"Clipboard decrypt error: {e}")
+            if text:
+                self.clipboard.set_text(text, update_last=True)
+                return ProtocolMessage.serialize("ACK", {"status": "clipboard_set"})
+            return None
 
         elif msg_type == "SWITCH_MONITOR":
             mon_id = payload.get("monitor_id", 0)
@@ -237,49 +247,103 @@ class HostDaemon:
         return None
 
     def _execute_input(self, cmd: dict):
-        action = cmd.get("type", "")
+        action = str(cmd.get("type", "")).lower().strip()
         mon_bounds = self.capture.get_active_monitor_bounds() if self.capture else None
         virt_bounds = self.capture.get_virtual_desktop_bounds() if self.capture else None
 
         nx = cmd.get("x")
         ny = cmd.get("y")
+        dx = cmd.get("dx")
+        dy = cmd.get("dy")
         btn = cmd.get("button", "left")
 
-        if action == "mouse_move":
-            if nx is not None and ny is not None:
-                self.input_handler.move_mouse(nx, ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-        elif action == "mouse_down":
+        # 1. Mouse Move / Drag / Trackpad
+        if action in ("mouse_move", "move", "touch_move", "cursor_move"):
+            if dx is not None and dy is not None and (nx is None or ny is None):
+                self.input_handler.move_mouse_relative(float(dx), float(dy))
+            elif nx is not None and ny is not None:
+                self.input_handler.move_mouse(float(nx), float(ny), monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+
+        # 2. Mouse / Touch Down
+        elif action in ("mouse_down", "touch_down", "down", "pointer_down"):
             self.input_handler.mouse_down(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-        elif action == "mouse_up":
+
+        # 3. Mouse / Touch Up
+        elif action in ("mouse_up", "touch_up", "up", "pointer_up"):
             self.input_handler.mouse_up(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-        elif action == "mouse_click":
-            if nx is not None and ny is not None:
-                self.input_handler.move_mouse(nx, ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-            self.input_handler.mouse_down(btn)
-            self.input_handler.mouse_up(btn)
-        elif action == "mouse_double_click":
-            if nx is not None and ny is not None:
-                self.input_handler.move_mouse(nx, ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-            self.input_handler.mouse_down(btn)
-            self.input_handler.mouse_up(btn)
-            self.input_handler.mouse_down(btn)
-            self.input_handler.mouse_up(btn)
-        elif action == "mouse_wheel":
-            self.input_handler.mouse_wheel(cmd.get("delta", 0), norm_x=nx, norm_y=ny,
-                                          monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
-        elif action == "key_down":
-            self.input_handler.key_down(cmd.get("vk", 0))
-        elif action == "key_up":
-            self.input_handler.key_up(cmd.get("vk", 0))
-        elif action == "unicode_char":
-            self.input_handler.send_unicode_char(cmd.get("char", ""))
-        elif action == "special":
-            self.input_handler.send_special(cmd.get("command", ""))
+
+        # 4. Click / Tap (with physical down->up delay for Windows GUI)
+        elif action in ("mouse_click", "click", "tap"):
+            self.input_handler.mouse_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+
+        # 5. Right Click / Secondary / Context Menu
+        elif action in ("right_click", "context_menu", "secondary_click"):
+            self.input_handler.mouse_click("right", norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+
+        # 6. Double Click / Double Tap
+        elif action in ("mouse_double_click", "double_click", "double_tap"):
+            self.input_handler.mouse_double_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+
+        # 7. Mouse Wheel / Scroll
+        elif action in ("mouse_wheel", "wheel", "scroll"):
+            delta = cmd.get("delta") or cmd.get("dy", 0)
+            self.input_handler.mouse_wheel(delta, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+
+        # 8. Keyboard Key Down
+        elif action in ("key_down", "keydown"):
+            vk = cmd.get("vk", 0)
+            char = cmd.get("char") or cmd.get("text")
+            if (not vk or vk == 0) and char:
+                self.input_handler.send_unicode_char(char)
+            elif vk:
+                self.input_handler.key_down(int(vk))
+            elif cmd.get("key"):
+                k = str(cmd.get("key")).lower()
+                from src.input_handler import VK_MAP
+                if k in VK_MAP:
+                    self.input_handler.key_down(VK_MAP[k])
+                else:
+                    self.input_handler.send_unicode_char(cmd.get("key"))
+
+        # 9. Keyboard Key Up
+        elif action in ("key_up", "keyup"):
+            vk = cmd.get("vk", 0)
+            if vk:
+                self.input_handler.key_up(int(vk))
+            elif cmd.get("key"):
+                k = str(cmd.get("key")).lower()
+                from src.input_handler import VK_MAP
+                if k in VK_MAP:
+                    self.input_handler.key_up(VK_MAP[k])
+
+        # 10. Unicode Text / Typing (Soft keyboard / Word input)
+        elif action in ("unicode_char", "char", "text", "type_text", "string", "input_text"):
+            text_val = cmd.get("text") or cmd.get("char") or cmd.get("string") or ""
+            if text_val:
+                self.input_handler.send_unicode_char(text_val)
+
+        # 11. Special Shortcuts / Combos / Hotkeys (Ctrl+C, Ctrl+V, Win+D, etc.)
+        elif action in ("special", "command", "shortcut", "hotkey", "key_combination", "combo"):
+            cmd_str = cmd.get("command") or cmd.get("shortcut") or cmd.get("key") or ""
+            keys_list = cmd.get("keys") or cmd.get("vk_list")
+            if keys_list:
+                if isinstance(keys_list[0], int):
+                    self.input_handler.send_key_combination(keys_list)
+                else:
+                    self.input_handler.send_key_combination_by_names(keys_list)
+            elif cmd_str:
+                self.input_handler.send_special(cmd_str)
+
+        # 12. Direct Clipboard Set via Input
+        elif action in ("clipboard", "set_clipboard", "copy_text", "paste_text"):
+            text_val = cmd.get("text") or cmd.get("data") or ""
+            if text_val:
+                self.clipboard.set_text(text_val, update_last=True)
 
     async def run_capture_stream(self, websocket, session_key: bytes):
-        """Streaming loop: captures screen and sends encrypted JPEG frames with change detection and flow control."""
+        """Streaming loop: captures screen and sends encrypted JPEG frames with zero-blocking threadpool & flow control."""
         if not self.capture:
-            self.capture = DesktopCapture(quality=55)
+            self.capture = DesktopCapture(quality=50)
         else:
             self.capture.switch_desktop()
             self.capture._last_thumb = None
@@ -298,14 +362,12 @@ class HostDaemon:
             if ws_state is None and not getattr(websocket, "open", True):
                 break
 
-            # Backpressure / Flow control: wait for client to finish processing previous frame
-            # If viewer or network is saturated, drop frame generation to keep input channel free
-            missed_ack = False
+            # Adaptive Backpressure: if previous frame hasn't been ACKed, wait briefly or skip frame
             if self._in_flight_frame:
                 try:
-                    await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.06)
+                    await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.08)
                 except asyncio.TimeoutError:
-                    missed_ack = True
+                    pass
                 finally:
                     self._in_flight_frame = False
                     self._frame_ack_event.clear()
@@ -313,22 +375,29 @@ class HostDaemon:
             start_t = time.time()
             t_cap_start = time.perf_counter_ns()
             try:
-                # Check clipboard change
-                if self.clipboard.has_changed():
-                    clip_text = self.clipboard.get_text()
-                    if clip_text:
-                        enc_clip = self.security.encrypt_packet(clip_text.encode("utf-8"), session_key)
-                        clip_msg = ProtocolMessage.serialize("CLIPBOARD", {}, binary_data=enc_clip)
-                        await websocket.send(clip_msg)
+                # Check clipboard change throttled to once per second (every 30 frames) to eliminate lock contention
+                if frame_counter % 30 == 0:
+                    try:
+                        if self.clipboard.has_changed():
+                            clip_text = self.clipboard.get_text()
+                            if clip_text:
+                                enc_clip = self.security.encrypt_packet(clip_text.encode("utf-8"), session_key)
+                                clip_msg = ProtocolMessage.serialize("CLIPBOARD", {}, binary_data=enc_clip)
+                                await websocket.send(clip_msg)
+                    except Exception:
+                        pass
 
                 frame_counter += 1
-                force_keyframe = (frame_counter == 1 or frame_counter % 30 == 0 or missed_ack)
-                jpeg_bytes, size, cur = self.capture.capture_frame(only_if_changed=(not force_keyframe))
+                force_keyframe = (frame_counter == 1 or frame_counter % 90 == 0)
+
+                # Offload heavy screen capture and image compression to background thread (keeps event loop unblocked)
+                cap_res = await asyncio.to_thread(self.capture.capture_frame, only_if_changed=(not force_keyframe))
+                jpeg_bytes, size, cur = cap_res
                 t_cap_done = time.perf_counter_ns()
 
                 if jpeg_bytes:
                     t_enc_start = time.perf_counter_ns()
-                    encrypted = self.security.encrypt_packet(jpeg_bytes, session_key)
+                    encrypted = await asyncio.to_thread(self.security.encrypt_packet, jpeg_bytes, session_key)
                     t_enc_done = time.perf_counter_ns()
 
                     meta = {
