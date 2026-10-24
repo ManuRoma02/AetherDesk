@@ -141,24 +141,32 @@ class HostDaemon:
             return None
 
         # Guard all state-altering or information-disclosing commands behind authentication
-        if msg_type in ("INPUT", "CLIPBOARD", "SWITCH_MONITOR", "GET_MONITORS", "PRIVACY_MODE", "SET_QUALITY", "FILE_START", "FILE_CHUNK", "FILE_END"):
+        msg_upper = (msg_type or "").upper()
+        if msg_upper in ("INPUT", "MOUSE", "TOUCH", "POINTER", "KEYBOARD", "CLIPBOARD", "SWITCH_MONITOR", "GET_MONITORS", "PRIVACY_MODE", "SET_QUALITY", "FILE_START", "FILE_CHUNK", "FILE_END"):
             if not session_state.get("authenticated"):
                 return ProtocolMessage.serialize("AUTH_FAILED", {"error": "Autenticazione richiesta"})
 
-        if msg_type == "INPUT":
+        if msg_upper in ("INPUT", "MOUSE", "TOUCH", "POINTER", "KEYBOARD"):
             key = session_state.get("session_key")
             cmd = None
-            if key and binary:
-                try:
-                    decrypted = self.security.decrypt_packet(binary, key)
-                    cmd = json.loads(decrypted.decode("utf-8"))
-                except Exception as e:
-                    logger.error(f"Failed to decrypt input packet: {e}")
-                    return None
-            elif payload and "cmd" in payload:
-                cmd = payload["cmd"]
-            elif payload and "type" in payload:
-                cmd = payload
+            if binary:
+                if key:
+                    try:
+                        decrypted = self.security.decrypt_packet(binary, key)
+                        cmd = json.loads(decrypted.decode("utf-8"))
+                    except Exception:
+                        pass
+                if cmd is None:
+                    try:
+                        cmd = json.loads(binary.decode("utf-8"))
+                    except Exception as e:
+                        logger.error(f"Failed to parse input binary packet: {e}")
+            if cmd is None and payload:
+                if isinstance(payload, dict):
+                    if "cmd" in payload and isinstance(payload["cmd"], dict):
+                        cmd = payload["cmd"]
+                    else:
+                        cmd = payload
 
             if cmd:
                 self._execute_input(cmd)
@@ -182,13 +190,13 @@ class HostDaemon:
         elif msg_type == "SWITCH_MONITOR":
             mon_id = payload.get("monitor_id", 0)
             if not self.capture:
-                self.capture = DesktopCapture(quality=70)
+                self.capture = DesktopCapture(quality=55)
             self.capture.set_monitor(mon_id)
             return ProtocolMessage.serialize("ACK", {"status": "monitor_switched", "monitor_id": mon_id})
 
         elif msg_type == "GET_MONITORS":
             if not self.capture:
-                self.capture = DesktopCapture(quality=70)
+                self.capture = DesktopCapture(quality=55)
             mons = self.capture.get_monitors_list()
             return ProtocolMessage.serialize("MONITORS_LIST", {"monitors": mons})
 
@@ -247,15 +255,36 @@ class HostDaemon:
         return None
 
     def _execute_input(self, cmd: dict):
-        action = str(cmd.get("type", "")).lower().strip()
+        if not isinstance(cmd, dict):
+            return
+
+        action = str(
+            cmd.get("type", "")
+            or cmd.get("action", "")
+            or cmd.get("event", "")
+            or cmd.get("name", "")
+            or ""
+        ).lower().strip()
         mon_bounds = self.capture.get_active_monitor_bounds() if self.capture else None
         virt_bounds = self.capture.get_virtual_desktop_bounds() if self.capture else None
 
-        nx = cmd.get("x")
-        ny = cmd.get("y")
+        nx = cmd.get("x") if cmd.get("x") is not None else cmd.get("norm_x")
+        if nx is None:
+            nx = cmd.get("clientX") or cmd.get("touchX") or cmd.get("px")
+        ny = cmd.get("y") if cmd.get("y") is not None else cmd.get("norm_y")
+        if ny is None:
+            ny = cmd.get("clientY") or cmd.get("touchY") or cmd.get("py")
+
         dx = cmd.get("dx")
         dy = cmd.get("dy")
         btn = cmd.get("button", "left")
+
+        # Pointer down/up flag support (e.g. from mobile gesture recognizers)
+        if "down" in cmd and not action:
+            action = "mouse_down" if cmd["down"] else "mouse_up"
+
+        if not action and nx is not None and ny is not None:
+            action = "click" if ("button" in cmd or "click" in cmd) else "mouse_move"
 
         # 1. Mouse Move / Drag / Trackpad
         if action in ("mouse_move", "move", "touch_move", "cursor_move"):
@@ -273,7 +302,7 @@ class HostDaemon:
             self.input_handler.mouse_up(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
 
         # 4. Click / Tap (with physical down->up delay for Windows GUI)
-        elif action in ("mouse_click", "click", "tap"):
+        elif action in ("mouse_click", "click", "tap", "touch_tap", "pointer_click"):
             self.input_handler.mouse_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
 
         # 5. Right Click / Secondary / Context Menu

@@ -274,86 +274,59 @@ class InputHandler:
 
     def mouse_down(self, button = "left", norm_x: float = None, norm_y: float = None,
                    monitor_bounds=None, virtual_bounds=None):
-        self._ensure_input_desktop()
         button = normalize_button(button)
-        abs_x, abs_y = 0, 0
-        use_abs = False
         if norm_x is not None and norm_y is not None:
-            pixel_x, pixel_y, abs_x, abs_y = self._calc_coords(norm_x, norm_y, monitor_bounds, virtual_bounds)
-            self.last_pixel_pos = (pixel_x, pixel_y)
-            self.user32.SetCursorPos(pixel_x, pixel_y)
-            use_abs = True
+            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
 
-        flag = 0
-        if button == "left":
-            flag = MOUSEEVENTF_LEFTDOWN
-        elif button == "right":
+        flag = MOUSEEVENTF_LEFTDOWN
+        if button == "right":
             flag = MOUSEEVENTF_RIGHTDOWN
         elif button == "middle":
             flag = MOUSEEVENTF_MIDDLEDOWN
-        else:
-            return
 
         inp = INPUT()
         inp.type = INPUT_MOUSE
-        if use_abs:
-            inp.union.mi.dx = abs_x
-            inp.union.mi.dy = abs_y
-            inp.union.mi.dwFlags = flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        else:
-            inp.union.mi.dwFlags = flag
+        inp.union.mi.dwFlags = flag
+        inp.union.mi.dx = 0
+        inp.union.mi.dy = 0
+        inp.union.mi.dwExtraInfo = 100
 
         if not self._send_input(inp):
-            if use_abs:
-                self.user32.mouse_event(flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, abs_x, abs_y, 0, 0)
-            else:
-                self.user32.mouse_event(flag, 0, 0, 0, 0)
+            self.user32.mouse_event(flag, 0, 0, 0, 0)
+        self.user32.mouse_event(flag, 0, 0, 0, 0)
 
     def mouse_up(self, button = "left", norm_x: float = None, norm_y: float = None,
                  monitor_bounds=None, virtual_bounds=None):
-        self._ensure_input_desktop()
         button = normalize_button(button)
-        abs_x, abs_y = 0, 0
-        use_abs = False
         if norm_x is not None and norm_y is not None:
-            pixel_x, pixel_y, abs_x, abs_y = self._calc_coords(norm_x, norm_y, monitor_bounds, virtual_bounds)
-            self.last_pixel_pos = (pixel_x, pixel_y)
-            self.user32.SetCursorPos(pixel_x, pixel_y)
-            use_abs = True
+            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
 
-        flag = 0
-        if button == "left":
-            flag = MOUSEEVENTF_LEFTUP
-        elif button == "right":
+        flag = MOUSEEVENTF_LEFTUP
+        if button == "right":
             flag = MOUSEEVENTF_RIGHTUP
         elif button == "middle":
             flag = MOUSEEVENTF_MIDDLEUP
-        else:
-            return
 
         inp = INPUT()
         inp.type = INPUT_MOUSE
-        if use_abs:
-            inp.union.mi.dx = abs_x
-            inp.union.mi.dy = abs_y
-            inp.union.mi.dwFlags = flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        else:
-            inp.union.mi.dwFlags = flag
+        inp.union.mi.dwFlags = flag
+        inp.union.mi.dx = 0
+        inp.union.mi.dy = 0
+        inp.union.mi.dwExtraInfo = 100
 
         if not self._send_input(inp):
-            if use_abs:
-                self.user32.mouse_event(flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, abs_x, abs_y, 0, 0)
-            else:
-                self.user32.mouse_event(flag, 0, 0, 0, 0)
+            self.user32.mouse_event(flag, 0, 0, 0, 0)
+        self.user32.mouse_event(flag, 0, 0, 0, 0)
 
     def mouse_click(self, button = "left", norm_x: float = None, norm_y: float = None,
                     monitor_bounds=None, virtual_bounds=None):
         """Execute full click with mandatory hardware delay so Windows UI registers the event."""
+        button = normalize_button(button)
         if norm_x is not None and norm_y is not None:
             self.move_mouse(norm_x, norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
-        self.mouse_down(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
-        time.sleep(0.015)
-        self.mouse_up(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
+        self.mouse_down(button)
+        time.sleep(0.025)
+        self.mouse_up(button)
 
     def mouse_double_click(self, button = "left", norm_x: float = None, norm_y: float = None,
                            monitor_bounds=None, virtual_bounds=None):

@@ -13,7 +13,7 @@ from typing import Optional, Callable, Tuple
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.3.9"
+CURRENT_VERSION = "1.4.0"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 class OTAUpdateState(str, Enum):
