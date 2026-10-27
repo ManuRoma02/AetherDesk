@@ -1,19 +1,24 @@
 import pytest
 import os
+import secrets
 from pathlib import Path
 from src.transfer import ClipboardManager, FileTransferManager
 
 def test_clipboard_manager_get_set():
     mgr = ClipboardManager()
-    mgr.set_text("HelloFromTest2026")
-    assert mgr.get_text() == "HelloFromTest2026"
+    txt = f"HelloFromTest_{secrets.token_hex(4)}"
+    mgr.set_text(txt)
+    assert mgr.get_text() == txt
 
 def test_clipboard_change_detection():
     mgr = ClipboardManager()
-    mgr.set_text("InitialText")
-    mgr.last_text = "InitialText"
+    uid = secrets.token_hex(4)
+    init_txt = f"Initial_{uid}"
+    changed_txt = f"Changed_{uid}"
+    mgr.set_text(init_txt)
+    mgr.last_text = init_txt
     assert mgr.has_changed() is False
-    mgr.set_text("ChangedText", update_last=False)
+    mgr.set_text(changed_txt, update_last=False)
     assert mgr.has_changed() is True
 
 def test_file_transfer_chunking(tmp_path):

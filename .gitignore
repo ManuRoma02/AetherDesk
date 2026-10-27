@@ -18,3 +18,9 @@ config.json
 
 # Rustdesk reference repo
 rustdesk/
+
+# Cryptographic Keys (Strictly offline, never commit private keys)
+*.key
+*.pem
+*.priv
+*private_key*

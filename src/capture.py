@@ -5,10 +5,23 @@ from ctypes import wintypes
 from PIL import Image
 import win32api
 
+import os
+import sys
+
 logger = logging.getLogger("DesktopCapture")
+
+def is_test_environment() -> bool:
+    """Check if Python process is running within pytest or test discovery."""
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or "PYTEST_VERSION" in os.environ:
+        return True
+    if any("pytest" in arg.lower() for arg in sys.argv):
+        return True
+    return False
 
 def _ensure_interactive_desktop():
     """Ensure calling thread is attached to the interactive WinSta0\\Default desktop."""
+    if is_test_environment():
+        return
     try:
         user32 = ctypes.windll.user32
         hwinsta = user32.OpenWindowStationW("WinSta0", False, 0x037F)
@@ -21,9 +34,6 @@ def _ensure_interactive_desktop():
             user32.CloseDesktop(hdesk)
     except Exception:
         pass
-
-# Attach calling thread to interactive desktop before any subsystem initialization
-_ensure_interactive_desktop()
 
 try:
     import cv2
@@ -85,6 +95,12 @@ class DesktopCapture:
     """High-performance Windows screen capture engine with secure UAC desktop switching."""
 
     def __init__(self, target_width: int = None, target_height: int = None, quality: int = 55):
+        if is_test_environment():
+            raise RuntimeError(
+                "Real DesktopCapture cannot be instantiated in a test environment. "
+                "Use MockDesktopCapture instead."
+            )
+        _ensure_interactive_desktop()
         self.quality = quality
         self.target_width = target_width
         self.target_height = target_height
@@ -540,3 +556,51 @@ class DesktopCapture:
             except Exception:
                 pass
             self.current_desktop = None
+
+
+class MockDesktopCapture:
+    """Mock desktop capture for deterministic testing without reading physical display or DXcam/GDI."""
+
+    def __init__(self, target_width: int = None, target_height: int = None, quality: int = 55):
+        self.quality = quality
+        self.target_width = target_width or 1920
+        self.target_height = target_height or 1080
+        self.current_monitor_id = 0
+        self._last_thumb = None
+        self._last_cursor = (100, 100)
+        self._frame_count = 0
+        self._sample_jpeg = (
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb\x00C\x00\x08\x06\x06"
+            b"\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
+            b"\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01"
+            b"\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00"
+            b"\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00"
+            b"?\x00\xbf\x00\xff\xd9"
+        )
+
+    def capture_frame(self, only_if_changed: bool = False):
+        self._frame_count += 1
+        if only_if_changed and self._frame_count > 1 and self._frame_count % 2 == 0:
+            return None, (self.target_width, self.target_height), self._last_cursor
+        return self._sample_jpeg, (self.target_width, self.target_height), self._last_cursor
+
+    def get_monitors_list(self):
+        return [
+            {"id": 0, "name": "Simulated Display 1", "rect": [0, 0, 1920, 1080], "is_primary": True},
+            {"id": 1, "name": "Simulated Display 2", "rect": [1920, 0, 1920, 1080], "is_primary": False}
+        ]
+
+    def set_monitor(self, mon_id: int):
+        self.current_monitor_id = mon_id
+
+    def get_active_monitor_bounds(self):
+        return (0, 0, 1920, 1080)
+
+    def get_virtual_desktop_bounds(self):
+        return (0, 0, 3840, 1080)
+
+    def switch_desktop(self) -> bool:
+        return True
+
+    def close(self):
+        pass

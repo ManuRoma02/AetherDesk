@@ -1,57 +1,31 @@
 @echo off
 setlocal
-echo ========================================================
-echo   Installazione Servizio RemoteDesktop (Avvio Automatico)
-echo ========================================================
-
-:: Verifica privilegi di amministratore
-net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo Richiesta permessi di amministratore...
-    powershell -Command "Start-Process '%~f0' -Verb RunAs"
-    exit /b
-)
-
-cd /d "%~dp0\.."
-
-set "SERVICE_NAME=RemoteDesktopHost"
-set "DISPLAY_NAME=Remote Desktop Unattended Host Service"
-
-if exist "%~dp0..\dist\AetherDesk.exe" (
-    set "EXE_CMD=\"%~dp0..\dist\AetherDesk.exe\" --host"
-) else if exist "%~dp0..\AetherDesk.exe" (
-    set "EXE_CMD=\"%~dp0..\AetherDesk.exe\" --host"
-) else (
-    set "BIN_PATH=%~dp0..\venv\Scripts\python.exe"
-    if not exist "%BIN_PATH%" (
-        for /f "tokens=*" %%i in ('where python') do set "BIN_PATH=%%i" & goto :found_python
-    )
-    :found_python
-    set "SCRIPT_PATH=%~dp0..\src\host_service.py"
-    set "EXE_CMD=\"%BIN_PATH%\" \"%SCRIPT_PATH%\""
-)
-
-echo Rimozione eventuale istanza precedente...
-schtasks /delete /tn "%SERVICE_NAME%" /f >nul 2>&1
-sc.exe stop %SERVICE_NAME% >nul 2>&1
-sc.exe delete %SERVICE_NAME% >nul 2>&1
-timeout /t 1 >nul
-
-echo Creazione attivita' di sistema ad avvio automatico all'accensione (SYSTEM)...
-schtasks /create /tn "%SERVICE_NAME%" /tr "%EXE_CMD%" /sc onstart /ru SYSTEM /rl highest /f >nul 2>&1
-
-if %errorLevel% equ 0 (
-    echo [OK] Attivita' pianificata creata con successo (Accesso non presidiato attivo prima del login).
-    echo Avvio immediato...
-    schtasks /run /tn "%SERVICE_NAME%" >nul 2>&1
-) else (
-    echo Configurazione fallback tramite Windows Service Manager (SCM)...
-    sc.exe create %SERVICE_NAME% binPath= "%EXE_CMD%" start= auto DisplayName= "%DISPLAY_NAME%" >nul 2>&1
-    sc.exe start %SERVICE_NAME% >nul 2>&1
-)
-
+echo ==============================================================================
+echo [ERRORE BLOCCANTE: INSTALLAZIONE SERVIZIO NON PRESIDIATO SOSPESA]
+echo ==============================================================================
+echo L'installazione di AetherDesk come Servizio di Sistema (SYSTEM in Session 0)
+echo e' bloccata per vincoli architetturali del sistema operativo Windows:
 echo.
-echo [OK] Servizio non presidiato installato e avviato!
-echo Il servizio rimarra' attivo ad ogni avvio o accensione del computer.
+echo 1. Isolamento Session 0: Windows esegue i servizi di sistema in Session 0,
+echo    un ambiente privo di desktop grafico utente (Session 1+) e privo di
+echo    instradamento per gli input generati tramite SendInput verso le app utente.
 echo.
-pause
+echo 2. Assenza del Session Agent: La cattura DXGI Desktop Duplication e il controllo
+echo    remoto del desktop richiedono un processo interattivo "Session Agent" avviato
+echo    all'interno della sessione utente attiva tramite WTSQueryUserToken e
+echo    CreateProcessAsUserW. Tale architettura non e' implementata nel repository.
+echo.
+echo 3. L'avvio in modalita' headless non risolve l'accesso desktop, ma evita solo
+echo    il caricamento della GUI Tkinter nel servizio.
+echo.
+echo 4. Nessuna modifica al sistema e' stata effettuata (nessun servizio rimosso
+echo    o alterato).
+echo.
+echo PERCORSO SUPPORTATO:
+echo L'accesso e controllo remoto host e' supportato avviando AetherDesk
+echo direttamente all'interno della sessione grafica dell'utente loggato:
+echo.
+echo    start_host.bat     oppure    dist\AetherDesk.exe --host
+echo ==============================================================================
+echo.
+exit /b 1

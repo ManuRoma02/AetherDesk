@@ -1,0 +1,14 @@
+# Dipendenze di runtime minime per AetherDesk (Windows Remote Desktop)
+# Rilevate esclusivamente dalle importazioni effettive del codice sorgente in src/
+#
+# AVVERTENZA SU RIPRODUCIBILITA':
+# Questo file definisce unicamente vincoli minimi di versione (>=).
+# NON costituisce un lockfile/constraints riproducibile, "pinned" o verificato
+# tramite build a runtime. Manca un file di lock/constraints con versioni esatte
+# e hash crittografici verificati.
+
+Pillow>=10.0.0
+cryptography>=41.0.0
+websockets>=12.0
+pywin32>=306; sys_platform == "win32"
+defusedxml>=0.7.1

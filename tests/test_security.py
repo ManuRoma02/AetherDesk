@@ -1,24 +1,28 @@
+import platform
 import pytest
-from src.security import SecurityManager
+from src.security import SecurityManager, MockTestDPAPIEngine
+
+def _test_dpapi():
+    return MockTestDPAPIEngine() if platform.system() != "Windows" else None
 
 def test_device_id_format(tmp_path):
-    mgr = SecurityManager(config_dir=str(tmp_path))
+    mgr = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     dev_id = mgr.get_or_create_device_id()
     clean_id = dev_id.replace(" ", "")
     assert len(clean_id) == 9
     assert clean_id.isdigit()
     # Verify persistence across instances
-    mgr2 = SecurityManager(config_dir=str(tmp_path))
+    mgr2 = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     assert mgr2.get_or_create_device_id() == dev_id
 
 def test_password_hashing(tmp_path):
-    mgr = SecurityManager(config_dir=str(tmp_path))
+    mgr = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     mgr.set_password("MioProgetto2026!")
     assert mgr.verify_password("MioProgetto2026!") is True
     assert mgr.verify_password("PasswordErrata") is False
 
 def test_packet_encryption(tmp_path):
-    mgr = SecurityManager(config_dir=str(tmp_path))
+    mgr = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     salt = b"random_salt_1234"
     key = mgr.derive_session_key("MioSegreto", salt)
     plaintext = b"Test packet payload for remote desktop"
@@ -28,8 +32,8 @@ def test_packet_encryption(tmp_path):
     assert decrypted == plaintext
 
 def test_anti_replay_protection(tmp_path):
-    mgr_sender = SecurityManager(config_dir=str(tmp_path / "sender"))
-    mgr_receiver = SecurityManager(config_dir=str(tmp_path / "receiver"))
+    mgr_sender = SecurityManager(config_dir=str(tmp_path / "sender"), dpapi_engine=_test_dpapi())
+    mgr_receiver = SecurityManager(config_dir=str(tmp_path / "receiver"), dpapi_engine=_test_dpapi())
     key = mgr_sender.derive_session_key("SecretKey2026", b"session_salt_1234")
 
     # Send 3 distinct packets in sequence
@@ -50,7 +54,7 @@ def test_anti_replay_protection(tmp_path):
         mgr_receiver.decrypt_packet(p1, key)
 
 def test_dpapi_and_high_iteration_password(tmp_path):
-    mgr = SecurityManager(config_dir=str(tmp_path))
+    mgr = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     mgr.set_password("SecurePassword2026!", iterations=600_000)
 
     # Check persistence and verification
@@ -59,12 +63,12 @@ def test_dpapi_and_high_iteration_password(tmp_path):
     assert mgr.get_master_key() is not None
 
     # Load fresh manager instance from disk
-    mgr2 = SecurityManager(config_dir=str(tmp_path))
+    mgr2 = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     assert mgr2.verify_password("SecurePassword2026!") is True
     assert mgr2.get_master_key() == mgr.get_master_key()
 
 def test_rate_limiting(tmp_path):
-    mgr = SecurityManager(config_dir=str(tmp_path))
+    mgr = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     ip = "192.168.1.100"
     assert mgr.is_rate_limited(ip) is False
     for _ in range(5):

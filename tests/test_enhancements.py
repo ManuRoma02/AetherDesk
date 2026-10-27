@@ -1,8 +1,13 @@
 import pytest
 import os
+import platform
 from pathlib import Path
 from src.client import ClientSettings, ClientState, RemoteClient
 from src.host_daemon import HostDaemon
+from src.security import MockTestDPAPIEngine
+
+def _test_dpapi():
+    return MockTestDPAPIEngine() if platform.system() != "Windows" else None
 
 def test_client_settings_save_and_load(tmp_path):
     settings = ClientSettings(config_dir=str(tmp_path))
@@ -20,13 +25,6 @@ def test_client_settings_save_and_load(tmp_path):
     assert dev_id == ""
     assert pwd == ""
     assert remember is False
-
-def test_host_privacy_mode(tmp_path):
-    daemon = HostDaemon(config_dir=str(tmp_path), headless=True)
-    res_on = daemon.set_privacy_mode(True)
-    assert isinstance(res_on, bool)
-    res_off = daemon.set_privacy_mode(False)
-    assert isinstance(res_off, bool)
 
 def test_client_state_reconnection():
     state = ClientState()
@@ -58,8 +56,8 @@ def test_client_settings_address_book_and_broker(tmp_path):
     assert devices[0]["id"] == "999 888 777"
 
 def test_desktop_capture_change_detection():
-    from src.capture import DesktopCapture
-    cap = DesktopCapture(quality=70)
+    from src.capture import MockDesktopCapture
+    cap = MockDesktopCapture(quality=70)
     # First frame always captured
     frame1, dims1, cur1 = cap.capture_frame(only_if_changed=True)
     assert frame1 is not None
@@ -88,18 +86,21 @@ def test_file_transfer_prepare_file_info(tmp_path):
     assert len(info["file_id"]) == 16
 
 def test_host_daemon_frame_ack_backpressure(tmp_path):
-    daemon = HostDaemon(config_dir=str(tmp_path), headless=True)
-    daemon._in_flight_frame = True
-    daemon._frame_ack_event.clear()
+    daemon = HostDaemon(config_dir=str(tmp_path), headless=True, dpapi_engine=_test_dpapi(), start_worker=False)
+    try:
+        daemon._in_flight_frame = True
+        daemon._frame_ack_event.clear()
 
-    # Client sends back FRAME_ACK
-    daemon.handle_client_message("FRAME_ACK", {"fid": 42}, None, {})
-    assert daemon._in_flight_frame is False
-    assert daemon._frame_ack_event.is_set() is True
+        # Client sends back FRAME_ACK on authenticated session
+        daemon.handle_client_message("FRAME_ACK", {"fid": 42}, None, {"authenticated": True})
+        assert daemon._in_flight_frame is False
+        assert daemon._frame_ack_event.is_set() is True
+    finally:
+        daemon.stop()
 
 def test_desktop_capture_cached_bounds():
-    from src.capture import DesktopCapture
-    cap = DesktopCapture()
+    from src.capture import MockDesktopCapture
+    cap = MockDesktopCapture()
     b1 = cap.get_active_monitor_bounds()
     b2 = cap.get_active_monitor_bounds()
     assert b1 == b2

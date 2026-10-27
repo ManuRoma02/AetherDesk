@@ -1,3 +1,14 @@
+"""
+AetherDesk Client Viewer GUI Layer.
+
+Architectural Boundary:
+- GUI Layer: Tkinter event loop runs exclusively on the main UI thread.
+- Asyncio Runtime Layer: Dedicated network background thread runs an asyncio event loop for client network operations.
+  UI dispatches async calls via asyncio.run_coroutine_threadsafe.
+- Host Session Layer: HostDaemon manages its own thread, embedded signaling broker, capture, and input worker.
+  GUI interacts with HostDaemon only via thread-safe lifecycle methods (start, stop).
+"""
+
 import io
 import os
 import sys
@@ -12,7 +23,14 @@ from pathlib import Path
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-if sys.platform == "win32":
+def is_test_environment() -> bool:
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or "PYTEST_VERSION" in os.environ:
+        return True
+    if any("pytest" in arg.lower() for arg in sys.argv):
+        return True
+    return False
+
+if sys.platform == "win32" and not is_test_environment():
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
@@ -119,6 +137,7 @@ class ClientViewerGUI:
         self._center_window(self.root, 520, 680)
         self.root.configure(bg=THEME["bg"])
         self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_main_window_close)
 
         # Set official window icon
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -178,6 +197,8 @@ class ClientViewerGUI:
         self.client.on_ota_progress_callback = self._on_ota_progress
         self.client.on_ota_complete_callback = self._on_ota_complete
         self.client.on_monitors_callback = self._on_monitors_received
+        self.client.on_verify_fingerprint_callback = self._on_verify_host_fingerprint
+        self.client.on_disconnect_callback = self._on_remote_disconnect
 
         # Host daemon integrated management
         self.security = SecurityManager()
@@ -775,6 +796,58 @@ class ClientViewerGUI:
                     pass
             self.root.after(1500, _revert_pwd_btn)
 
+    def _on_main_window_close(self):
+        """Coordinated, deterministic shutdown of GUI, client, host daemon, and network threads."""
+        logger.info("Main window closing, initiating clean shutdown sequence...")
+
+        # 1. Stop host daemon if running
+        if self.host_daemon:
+            try:
+                self.host_daemon.stop(timeout=2.0)
+            except Exception as e:
+                logger.warning(f"Host daemon stop error: {e}")
+
+        # 2. Join host thread if alive (do not drop reference if still alive)
+        if self.host_thread and self.host_thread.is_alive():
+            try:
+                self.host_thread.join(timeout=2.0)
+                if not self.host_thread.is_alive():
+                    self.host_thread = None
+                else:
+                    logger.warning("Host thread still running after timeout")
+            except Exception as e:
+                logger.warning(f"Host thread join error: {e}")
+
+        # 3. Disconnect client on its owning loop and await completion
+        if self.client and self.loop and self.loop.is_running():
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
+                fut.result(timeout=2.0)
+            except Exception as e:
+                logger.warning(f"Client disconnect error during shutdown: {e}")
+
+        # 4. Stop client network loop and join network thread
+        if self.loop and self.loop.is_running():
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except Exception:
+                pass
+        if self.network_thread and self.network_thread.is_alive():
+            try:
+                self.network_thread.join(timeout=2.0)
+                if not self.network_thread.is_alive():
+                    self.network_thread = None
+                else:
+                    logger.warning("Network thread still running after timeout")
+            except Exception as e:
+                logger.warning(f"Network thread join error: {e}")
+
+        # 5. Cleanly destroy Tkinter root
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _toggle_host_daemon(self):
         if not self.host_daemon or not self.host_daemon.running:
             self.host_daemon = HostDaemon(broker_url="ws://127.0.0.1:8765")
@@ -785,27 +858,23 @@ class ClientViewerGUI:
             if hasattr(self, "lbl_host_status"):
                 self.lbl_host_status.config(text="● Servizio Host Attivo (In ascolto su porta 8765)", fg=THEME["success"])
         else:
-            self.host_daemon.stop()
-            if hasattr(self, "host_broker") and self.host_broker:
-                try:
-                    asyncio.run(self.host_broker.stop())
-                except Exception:
-                    pass
-                self.host_broker = None
+            if self.host_daemon:
+                self.host_daemon.stop(timeout=2.0)
+                self.host_daemon = None
+            if self.host_thread and self.host_thread.is_alive():
+                self.host_thread.join(timeout=2.0)
+                self.host_thread = None
+            self.host_broker = None
             if hasattr(self, "btn_host_toggle"):
                 self.btn_host_toggle.config(text="Avvia Demone", bg=THEME["accent"])
             if hasattr(self, "lbl_host_status"):
                 self.lbl_host_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
 
     def _run_host_daemon_worker(self):
-        async def runner():
-            try:
-                self.host_broker = SignalingBroker(host="0.0.0.0", port=8765)
-                await self.host_broker.start()
-            except Exception:
-                pass
-            await self.host_daemon.start()
-        asyncio.run(runner())
+        try:
+            asyncio.run(self.host_daemon.start())
+        except Exception as e:
+            logger.debug(f"Host daemon worker exited: {e}")
 
     def _open_firewall_unblock(self):
         base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -1382,7 +1451,12 @@ class ClientViewerGUI:
                             f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
                         )
                         if confirm:
-                            self._start_git_download(info["download_url"], tag)
+                            self._start_git_download(
+                                info["download_url"],
+                                tag,
+                                expected_sha256=info.get("expected_sha256"),
+                                signed_manifest=info.get("manifest")
+                            )
                 else:
                     tag = info.get("tag", get_app_version())
                     err = info.get("error")
@@ -1441,14 +1515,25 @@ class ClientViewerGUI:
             )
             if not confirm:
                 return
-            self._start_git_download(info["download_url"], info["tag"])
+            self._start_git_download(
+                info["download_url"],
+                info["tag"],
+                expected_sha256=info.get("expected_sha256"),
+                signed_manifest=info.get("manifest")
+            )
         else:
             threading.Thread(
                 target=lambda: self._check_git_updates_background(notify_if_none=True, prompt_on_found=True),
                 daemon=True
             ).start()
 
-    def _start_git_download(self, download_url: str, target_version: str):
+    def _start_git_download(
+        self,
+        download_url: str,
+        target_version: str,
+        expected_sha256: Optional[str] = None,
+        signed_manifest: Optional[dict] = None
+    ):
         self.ota_downloading = True
         if self.btn_header_update:
             self.btn_header_update.config(text="⏳ Scaricamento...", state=tk.DISABLED)
@@ -1469,7 +1554,12 @@ class ClientViewerGUI:
                     self._on_status_update(f"Download da Git: {pct}%...")
                 self._safe_after(0, up)
 
-            ok, temp_path_or_err = download_github_binary(download_url, progress_callback=on_progress)
+            ok, temp_path_or_err = download_github_binary(
+                download_url,
+                progress_callback=on_progress,
+                expected_sha256=expected_sha256,
+                signed_manifest=signed_manifest
+            )
             if not ok:
                 self.ota_downloading = False
                 def err():
@@ -1481,7 +1571,12 @@ class ClientViewerGUI:
                 self._safe_after(0, err)
                 return
 
-            applied, app_msg = apply_in_place_update(temp_path_or_err, target_version=target_version)
+            applied, app_msg = apply_in_place_update(
+                temp_path_or_err,
+                target_version=target_version,
+                expected_sha256=expected_sha256,
+                signed_manifest=signed_manifest
+            )
             self.ota_downloading = False
             def finish():
                 if applied:
@@ -1497,6 +1592,12 @@ class ClientViewerGUI:
                     import os
                     os._exit(0)
                 else:
+                    try:
+                        p_temp = Path(temp_path_or_err)
+                        if p_temp.is_file():
+                            p_temp.unlink()
+                    except Exception:
+                        pass
                     messagebox.showerror("Errore Aggiornamento", app_msg)
                     if self.btn_header_update:
                         self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL)
@@ -1579,6 +1680,9 @@ class ClientViewerGUI:
                 pass
         self.root.after(1500, self._sync_clipboard_loop)
 
+    def _on_remote_disconnect(self):
+        self._safe_after(0, self._close_viewer)
+
     def _close_viewer(self):
         self._close_dual_window()
         asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
@@ -1599,6 +1703,42 @@ class ClientViewerGUI:
             self._render_scheduled = True
             self.root.after(0, self._render_latest_frame)
 
+    def _on_verify_host_fingerprint(self, device_id: str, fingerprint: str) -> bool:
+        """Prompt user with explicit full 32-byte SHA-256 fingerprint on first pairing."""
+        if not self.root or not self.root.winfo_exists():
+            return False  # Never approve first pairing without an active UI window
+
+        result = [False]
+        ev = threading.Event()
+
+        def prompt():
+            try:
+                # Format 32-byte fingerprint into two clean 16-byte lines for comfortable reading
+                parts = fingerprint.split(":")
+                fp_display = fingerprint
+                if len(parts) == 32:
+                    fp_display = ":".join(parts[:16]) + "\n" + ":".join(parts[16:])
+
+                msg = (
+                    f"Primo collegamento al dispositivo: {device_id}\n\n"
+                    f"Impronta di sicurezza SHA-256 completa (32 byte / 64 caratteri esadecimali):\n\n"
+                    f"{fp_display}\n\n"
+                    f"Confermi che l'impronta corrisponde al computer a cui vuoi collegarti?\n"
+                    f"(Verrà memorizzata in modo permanente per impedire attacchi man-in-the-middle)"
+                )
+                res = messagebox.askyesno("Verifica Impronta Digitale Host (SHA-256)", msg, parent=self.root)
+                result[0] = bool(res)
+            except Exception:
+                result[0] = False
+            finally:
+                ev.set()
+
+        self._safe_after(0, prompt)
+        signaled = ev.wait(timeout=30.0)
+        if not signaled:
+            return False  # Timeout: abort first pairing without pinning
+        return result[0]
+
     def _render_latest_frame(self):
         self._render_scheduled = False
         if not self.canvas or not getattr(self, "_pending_frame", None):
@@ -1606,14 +1746,14 @@ class ClientViewerGUI:
 
         t_render_start = time.perf_counter_ns()
         pending = self._pending_frame
-        jpeg_bytes, dims, cur = pending[0], pending[1], pending[2]
+        frame_bytes, dims, cur = pending[0], pending[1], pending[2]
         telemetry = pending[3] if len(pending) > 3 else {}
 
         # Frame rate & latency calculation
         self._frame_count += 1
         now = time.time()
-        t_send = telemetry.get("t_send", 0.0) if isinstance(telemetry, dict) else 0.0
-        if t_send > 0:
+        t_send = telemetry.get("t_send") if isinstance(telemetry, dict) else None
+        if t_send is not None and t_send > 0:
             e2e_ms = round((now - t_send) * 1000, 1)
             if 0 <= e2e_ms < 5000:
                 self._latencies.append(e2e_ms)
@@ -1634,7 +1774,15 @@ class ClientViewerGUI:
                 self.lbl_fps.config(text=f"FPS: {fps_val}{lat_str}{rnd_str}")
 
         try:
-            raw_img = Image.open(io.BytesIO(jpeg_bytes))
+            if frame_bytes.startswith(b"\xff\xd8"):
+                raw_img = Image.open(io.BytesIO(frame_bytes))
+            elif dims[0] > 0 and dims[1] > 0 and len(frame_bytes) >= dims[0] * dims[1] * 4:
+                raw_img = Image.frombytes("RGBA", dims, frame_bytes[:dims[0] * dims[1] * 4], "raw", "BGRA")
+            else:
+                try:
+                    raw_img = Image.open(io.BytesIO(frame_bytes))
+                except Exception:
+                    raw_img = Image.frombytes("RGBA", dims, frame_bytes, "raw", "BGRA")
             full_w, full_h = raw_img.size
             self._last_full_dims = (full_w, full_h)
 
@@ -1779,12 +1927,13 @@ class ClientViewerGUI:
     def _on_mouse_move(self, event, mon_idx: int = 0):
         nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
         now = time.time()
-        # High-performance rate limiting (50 Hz / 20ms) to eliminate WebSocket buffer saturation
-        if now - getattr(self, "_last_mouse_send_time", 0.0) < 0.020:
+        # Coalesce moves at 125 Hz; a 20 ms interval made the host cursor lag
+        # visibly behind the local pointer.
+        if now - getattr(self, "_last_mouse_send_time", 0.0) < 0.008:
             self._pending_mouse_coords = (nx, ny)
             if not getattr(self, "_mouse_timer_scheduled", False):
                 self._mouse_timer_scheduled = True
-                self._safe_after(20, self._flush_pending_mouse)
+                self._safe_after(8, self._flush_pending_mouse)
             return
 
         self._last_mouse_send_time = now
@@ -1863,16 +2012,9 @@ class ClientViewerGUI:
     def run(self):
         self.root.mainloop()
 
-if __name__ == "__main__":
+def build_parser():
     import argparse
     from src.ota import get_app_version
-
-    if sys.platform == "win32" and len(sys.argv) > 1:
-        try:
-            ctypes.windll.kernel32.AttachConsole(-1)
-        except Exception:
-            pass
-
     parser = argparse.ArgumentParser(
         description="AetherDesk Client - Ultra-Lightweight E2EE Remote Desktop Viewer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1888,8 +2030,25 @@ Examples:
     parser.add_argument("-p", "--password", default=None, help="Password for remote authentication")
     parser.add_argument("-b", "--broker", default=None, help="Signaling broker WebSocket URL")
     parser.add_argument("--host", action="store_true", help="Launch directly into AetherDesk Host mode")
+    parser.add_argument("--service", action="store_true", help="Launch in background headless host service mode (Windows Service / Session 0)")
     parser.add_argument("-v", "--version", action="version", version=f"AetherDesk Client v{get_app_version()}")
+    return parser
+
+if __name__ == "__main__":
+    if sys.platform == "win32" and len(sys.argv) > 1:
+        try:
+            ctypes.windll.kernel32.AttachConsole(-1)
+        except Exception:
+            pass
+
+    parser = build_parser()
     args = parser.parse_args()
+
+    if args.service:
+        from src.host_service import WindowsServiceManager
+        svc = WindowsServiceManager()
+        svc.run()
+        sys.exit(0)
 
     start_tab = "host" if args.host else "client"
     gui = ClientViewerGUI(broker_url=args.broker if args.broker else "ws://127.0.0.1:8765", start_tab=start_tab)

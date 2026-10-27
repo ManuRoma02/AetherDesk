@@ -1,14 +1,18 @@
 import pytest
 from pathlib import Path
-from src.security import SecurityManager
+import platform
+from src.security import SecurityManager, MockTestDPAPIEngine
+
+def _test_dpapi():
+    return MockTestDPAPIEngine() if platform.system() != "Windows" else None
 from src.client import RemoteClient
 from src.transfer import FileTransferManager
 from src.signaling_broker import SignalingBroker
 from src.protocol import ProtocolMessage
 
-def test_repro_client_missing_callbacks():
+def test_repro_client_missing_callbacks(tmp_path):
     """Verify RemoteClient has all expected callback attributes in __init__."""
-    client = RemoteClient()
+    client = RemoteClient(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     # These should be defined as None, not raise AttributeError
     assert hasattr(client, "on_frame_callback")
     assert hasattr(client, "on_status_callback")
@@ -20,6 +24,7 @@ def test_repro_file_transfer_path_traversal(tmp_path):
     ft = FileTransferManager(save_dir=str(tmp_path / "transfers"))
     malicious_filename = "../../evil.exe"
     target = ft.start_receiving("test_id", malicious_filename, 100)
+    ft.receive_chunk("test_id", 0, b"A" * 100)
     ft.finish_receiving("test_id")
     # target MUST be inside ft.save_dir and not traverse upwards
     assert target.parent.resolve() == ft.save_dir.resolve()
@@ -65,10 +70,11 @@ async def test_repro_broker_forwards_all_remote_desktop_messages():
 
 def test_repro_mutual_session_key_derivation(tmp_path):
     """Verify host and client derive identical session keys from the user password."""
-    sec = SecurityManager(config_dir=str(tmp_path))
+    sec = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     sec.set_password("MyStrongPass2026")
     host_salt = bytes.fromhex(sec.config["pwd_salt"])
-    master_key_host = bytes.fromhex(sec.config["master_key"])
+    master_key_host = sec.get_master_key()
+    assert master_key_host is not None
 
     # Client receives host_salt, has password "MyStrongPass2026"
     session_salt = b"random_session_salt_123"
@@ -98,11 +104,12 @@ def test_repro_client_viewer_gui_init():
 
 
 def test_security_manager_password_display(tmp_path):
-    """Verify SecurityManager provisions default password display and persists updates."""
-    sec = SecurityManager(config_dir=str(tmp_path))
+    """Verify SecurityManager provisions secure random password and persists updates without weak defaults."""
+    sec = SecurityManager(config_dir=str(tmp_path), dpapi_engine=_test_dpapi())
     pwd = sec.get_password_display()
-    assert pwd == "123456"
-    assert sec.verify_password("123456") is True
+    assert len(pwd) >= 8
+    assert pwd != "123456"
+    assert sec.verify_password(pwd) is True
 
     sec.set_password("CustomPass999")
     assert sec.get_password_display() == "CustomPass999"

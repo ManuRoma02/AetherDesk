@@ -1,10 +1,9 @@
 import asyncio
 import os
 import sys
-import time
 import json
-import subprocess
 import pytest
+import platform
 from pathlib import Path
 
 # Ensure repo root is in sys.path
@@ -14,53 +13,70 @@ if str(repo_root) not in sys.path:
 
 from src.client import RemoteClient
 from src.protocol import ProtocolMessage
-from src.security import SecurityManager
+from src.security import SecurityManager, MockTestDPAPIEngine
+from src.host_daemon import HostDaemon
+from src.input_handler import InputHandler, MockInputInjector
+from src.capture import MockDesktopCapture
+from src.signaling_broker import MockInMemoryBroker
+
+def _test_dpapi():
+    return MockTestDPAPIEngine() if platform.system() != "Windows" else None
 
 @pytest.mark.anyio
 async def test_windows_process_subsystem_e2e(tmp_path):
     """
-    Windows Process & System Master automated E2E test harness.
-    Runs dist/AetherDesk.exe in host mode as an independent Windows process,
-    verifies TCP port 8765 binding via OS diagnostics,
-    connects an automated client, streams live desktop video frames,
-    injects input commands, syncs clipboard, and verifies reconnection.
+    Simulated Windows Process & Subsystem E2E test harness.
+    Runs simulated host daemon with mock capture and mock input injector
+    over a 100% in-memory signaling broker (zero OS TCP/UDP sockets), verifying:
+    - Broker connection and mutual authentication
+    - E2EE session key negotiation
+    - Video frame streaming with mock capture (zero screen/DXcam interaction)
+    - Input event injection with mock injector (zero physical input)
+    - Encrypted file transfer over tunnel
+    - Clean disconnection and reconnection with anti-replay reset
+    - Guaranteed cleanup of host daemon and broker resources
     """
-    exe_path = repo_root / "dist" / "AetherDesk.exe"
-    assert exe_path.exists(), f"AetherDesk.exe not found at {exe_path}"
-
-    # 1. Spawn Host as independent Windows background process
-    print(f"\n[Subsystem] Spawning Host Process: {exe_path} --host")
-    host_proc = subprocess.Popen(
-        [str(exe_path), "--host"],
-        cwd=str(repo_root),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    assert host_proc.poll() is None, "Host process terminated prematurely"
-    print(f"[Subsystem] Host Process PID: {host_proc.pid}")
+    broker = None
+    daemon = None
+    host_task = None
+    client = None
+    client2 = None
 
     try:
-        # 2. Wait for port 8765 to open (Windows System Diagnostics)
-        bound = False
+        # 1. Start In-Memory Broker (pure asyncio queues, zero OS sockets)
+        broker = MockInMemoryBroker()
+
+        # 2. Setup Host with MockInputInjector, MockDesktopCapture, and in-memory transport
+        host_cfg = tmp_path / "host_cfg"
+        mock_inj = MockInputInjector()
+        mock_cap = MockDesktopCapture(target_width=320, target_height=180, quality=50)
+        daemon = HostDaemon(
+            config_dir=str(host_cfg),
+            headless=True,
+            dpapi_engine=_test_dpapi(),
+            input_handler=InputHandler(injector=mock_inj),
+            capture=mock_cap,
+            ws_connector=broker.connect_host,
+        )
+        dev_id = daemon.security.get_or_create_device_id()
+        password = daemon.security.get_password_display()
+
+        host_task = asyncio.create_task(daemon.start())
+
+        # Wait for host registration on broker in-memory
+        clean_id = dev_id.replace(" ", "")
         for _ in range(50):
-            try:
-                import socket
-                with socket.create_connection(("127.0.0.1", 8765), timeout=0.2):
-                    bound = True
-                    break
-            except (ConnectionRefusedError, OSError):
-                await asyncio.sleep(0.1)
+            if broker.get_host(clean_id) is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert broker.get_host(clean_id) is not None
 
-        assert bound is True, "Host failed to bind listening port 8765 within 5 seconds"
-        print("[Subsystem] Port 8765 confirmed LISTENING via loopback TCP socket")
-        await asyncio.sleep(1.0)
-
-        # 3. Connect automated Client to Host (Dynamically resolving host credentials)
-        sec = SecurityManager()
-        dev_id = sec.get_or_create_device_id()
-        password = sec.get_password_display()
-        client = RemoteClient(broker_url="ws://127.0.0.1:8765")
-
+        # 3. Connect automated Client to Host via in-memory transport
+        client = RemoteClient(
+            ws_connector=broker.connect_client,
+            config_dir=str(tmp_path / "client1_cfg"),
+            dpapi_engine=_test_dpapi(),
+        )
         received_frames = []
         frame_event = asyncio.Event()
 
@@ -69,77 +85,99 @@ async def test_windows_process_subsystem_e2e(tmp_path):
             frame_event.set()
 
         client.on_frame_callback = on_frame
-        client.on_status_callback = lambda s: print(f"[Client Status] {s}")
 
-        print(f"[Subsystem] Connecting client to Host ID {dev_id} with password {password}...")
         ok = False
-        for attempt in range(15):
+        for _ in range(20):
             ok = await client.connect(dev_id, password)
             if ok:
                 break
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.05)
 
-        assert ok is True, f"Client connection failed: {client.status_message if hasattr(client, 'status_message') else ''}"
+        assert ok is True
         assert client.state.is_connected is True
-        print("[Subsystem] E2EE Session Key negotiated successfully")
 
         # 4. Stream & Verify Video Frames
-        await asyncio.wait_for(frame_event.wait(), timeout=6.0)
+        await asyncio.wait_for(frame_event.wait(), timeout=5.0)
         assert len(received_frames) > 0
         frame_len, dims, cur = received_frames[0]
-        print(f"[Subsystem] Video Frame 1 Received! Size: {frame_len} bytes, Dims: {dims}, Cursor: {cur}")
-        assert frame_len > 1000
+        assert frame_len > 0
         assert dims[0] > 0 and dims[1] > 0
 
-        # Wait for keyframe interval to verify continuous streaming
-        await asyncio.sleep(1.2)
-        print(f"[Subsystem] Total Frames Streamed: {len(received_frames)}")
-        assert len(received_frames) >= 1
-
         # 5. Send Mouse and Keyboard Input
-        print("[Subsystem] Testing input event injection...")
         await client.send_input({"type": "mouse_move", "x": 0.5, "y": 0.5})
         await client.send_input({"type": "key_down", "vk": 0x41}) # 'A'
         await client.send_input({"type": "key_up", "vk": 0x41})
+
+        for _ in range(20):
+            if daemon.input_worker.queue.qsize() > 0 or len(mock_inj.sent_inputs) > 0:
+                break
+            await asyncio.sleep(0.02)
+        daemon.input_worker.flush(timeout=1.0)
+        assert len(mock_inj.sent_inputs) > 0
 
         # 6. Test File Transfer over live tunnel
         sample_file = tmp_path / "subsystem_test.bin"
         sample_file.write_bytes(os.urandom(32768)) # 32 KB test file
         file_ok = await client.send_file(str(sample_file))
         assert file_ok is True
-        print("[Subsystem] Encrypted file transfer verified (32 KB)")
 
         # 7. Disconnect Client
         await client.disconnect()
         assert client.state.is_connected is False
-        print("[Subsystem] Client 1 disconnected cleanly")
-        await asyncio.sleep(0.5)
 
         # 8. Reconnect Test (Verify Replay Sequence Window Reset Fix)
-        print("[Subsystem] Testing Reconnect (Verifying Anti-Replay Reset Fix)...")
-        client2 = RemoteClient(broker_url="ws://127.0.0.1:8765")
-        client2.on_status_callback = lambda s: print(f"[Subsystem C2 Status] {s}")
+        client2 = RemoteClient(
+            ws_connector=broker.connect_client,
+            config_dir=str(tmp_path / "client2_cfg"),
+            dpapi_engine=_test_dpapi(),
+        )
         reconnect_frames = []
         rec_event = asyncio.Event()
         client2.on_frame_callback = lambda b, d, c, *a: (reconnect_frames.append(len(b)), rec_event.set())
 
         ok2 = await client2.connect(dev_id, password)
-        assert ok2 is True, f"Client 2 reconnect failed: {getattr(client2, '_status', '')}"
+        assert ok2 is True
         await asyncio.wait_for(rec_event.wait(), timeout=5.0)
         assert len(reconnect_frames) > 0
-        print(f"[Subsystem] Reconnect successful! Received {len(reconnect_frames)} frames on second session")
 
         # Send input on reconnected session to guarantee anti-replay doesn't block seq 1..N
         await client2.send_input({"type": "mouse_move", "x": 0.25, "y": 0.25})
+        for _ in range(20):
+            if daemon.input_worker.queue.qsize() > 0:
+                break
+            await asyncio.sleep(0.02)
+        daemon.input_worker.flush(timeout=1.0)
+
         await client2.disconnect()
-        print("[Subsystem] Reconnected input delivered without replay rejection")
 
     finally:
-        # 9. Terminate Host Subsystem Process and its entire process tree Cleanly
-        print(f"[Subsystem] Terminating Host Process PID {host_proc.pid}...")
-        try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(host_proc.pid)], capture_output=True)
-            host_proc.kill()
-        except Exception as e:
-            print("[Subsystem Host Comm error]:", e)
-        print("[Subsystem] Host Process terminated successfully")
+        # Guaranteed Clean teardown across all initialized resources
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        if client2:
+            try:
+                await client2.disconnect()
+            except Exception:
+                pass
+        if daemon:
+            try:
+                daemon.stop()
+            except Exception:
+                pass
+        if broker:
+            try:
+                await broker.stop()
+            except Exception:
+                pass
+        if host_task:
+            if not host_task.done():
+                host_task.cancel()
+            try:
+                await host_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass

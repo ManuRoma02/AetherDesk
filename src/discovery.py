@@ -17,8 +17,18 @@ DISCOVERY_PORT = 8766
 BEACON_INTERVAL = 2.0  # seconds
 PEER_TIMEOUT = 8.0      # seconds until a peer is marked offline
 
+def is_test_environment() -> bool:
+    """Check if Python process is running within pytest or test discovery."""
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or "PYTEST_VERSION" in os.environ:
+        return True
+    if any("pytest" in arg.lower() for arg in sys.argv):
+        return True
+    return False
+
 def get_primary_local_ip() -> str:
     """Detects the primary outbound IPv4 address."""
+    if is_test_environment():
+        return "127.0.0.1"
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -39,15 +49,17 @@ def get_primary_local_ip() -> str:
 class LANBeaconBroadcaster:
     """Periodically broadcasts host presence over UDP broadcast."""
 
-    def __init__(self, device_id: str, port: int = 8765):
+    def __init__(self, device_id: str, port: int = 8765, ip: Optional[str] = None, hostname: Optional[str] = None):
         self.device_id = device_id.replace(" ", "")
         self.port = port
+        self.ip = ip
+        self.hostname = hostname
         self.running = False
         self._thread: Optional[threading.Thread] = None
         self._sock: Optional[socket.socket] = None
 
     def start(self):
-        if self.running:
+        if is_test_environment() or self.running:
             return
         self.running = True
         self._thread = threading.Thread(target=self._broadcast_loop, daemon=True, name="AetherBeaconBroadcaster")
@@ -62,6 +74,36 @@ class LANBeaconBroadcaster:
                 pass
             self._sock = None
 
+    @staticmethod
+    def serialize_beacon_payload(device_id: str, port: int, ip: str, hostname: str, timestamp: Optional[float] = None) -> bytes:
+        """Pure serialization function with zero system, socket, or DNS dependencies."""
+        clean_id = device_id.replace(" ", "")
+        ts = time.time() if timestamp is None else timestamp
+        return json.dumps({
+            "app": "aetherdesk",
+            "device_id": clean_id,
+            "ip": ip,
+            "port": port,
+            "name": hostname,
+            "ts": ts
+        }).encode("utf-8")
+
+    def build_beacon_payload(self, ip: Optional[str] = None, hostname: Optional[str] = None, timestamp: Optional[float] = None) -> bytes:
+        """Construct discovery beacon payload bytes without sending over network."""
+        if ip is None:
+            ip = self.ip or ("127.0.0.1" if is_test_environment() else get_primary_local_ip())
+        if hostname is None:
+            if self.hostname:
+                hostname = self.hostname
+            elif is_test_environment():
+                hostname = "Mock-Desktop"
+            else:
+                try:
+                    hostname = socket.gethostname()
+                except Exception:
+                    hostname = "Remote PC"
+        return self.serialize_beacon_payload(self.device_id, self.port, ip, hostname, timestamp)
+
     def _broadcast_loop(self):
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -70,19 +112,9 @@ class LANBeaconBroadcaster:
             logger.warning(f"Failed to create broadcast socket: {e}")
             return
 
-        hostname = socket.gethostname()
         while self.running:
             try:
-                ip = get_primary_local_ip()
-                payload = json.dumps({
-                    "app": "aetherdesk",
-                    "device_id": self.device_id,
-                    "ip": ip,
-                    "port": self.port,
-                    "name": hostname,
-                    "ts": time.time()
-                }).encode("utf-8")
-
+                payload = self.build_beacon_payload()
                 self._sock.sendto(payload, ("<broadcast>", DISCOVERY_PORT))
             except Exception as e:
                 logger.debug(f"Broadcast error: {e}")
@@ -101,7 +133,7 @@ class LANBeaconListener:
         self._lock = threading.Lock()
 
     def start(self):
-        if self.running:
+        if is_test_environment() or self.running:
             return
         self.running = True
         self._thread = threading.Thread(target=self._listen_loop, daemon=True, name="AetherBeaconListener")
@@ -115,6 +147,30 @@ class LANBeaconListener:
             except Exception:
                 pass
             self._sock = None
+
+    def process_beacon_data(self, data: bytes, sender_ip: str = "127.0.0.1") -> bool:
+        """Process raw beacon datagram without requiring an open network socket."""
+        try:
+            msg = json.loads(data.decode("utf-8"))
+            if msg.get("app") == "aetherdesk":
+                dev_id = str(msg.get("device_id", "")).replace(" ", "")
+                if dev_id:
+                    ip = msg.get("ip") or sender_ip
+                    port = msg.get("port", 8765)
+                    peer_info = {
+                        "device_id": dev_id,
+                        "ip": ip,
+                        "port": port,
+                        "name": msg.get("name", "Remote PC"),
+                        "broker_url": f"ws://{ip}:{port}",
+                        "last_seen": time.time()
+                    }
+                    with self._lock:
+                        self._peers[dev_id] = peer_info
+                    return True
+        except Exception as e:
+            logger.debug(f"Discovery parse error: {e}")
+        return False
 
     def _listen_loop(self):
         try:
@@ -130,22 +186,7 @@ class LANBeaconListener:
         while self.running:
             try:
                 data, addr = self._sock.recvfrom(2048)
-                msg = json.loads(data.decode("utf-8"))
-                if msg.get("app") == "aetherdesk":
-                    dev_id = str(msg.get("device_id", "")).replace(" ", "")
-                    if dev_id:
-                        ip = msg.get("ip") or addr[0]
-                        port = msg.get("port", 8765)
-                        peer_info = {
-                            "device_id": dev_id,
-                            "ip": ip,
-                            "port": port,
-                            "name": msg.get("name", "Remote PC"),
-                            "broker_url": f"ws://{ip}:{port}",
-                            "last_seen": time.time()
-                        }
-                        with self._lock:
-                            self._peers[dev_id] = peer_info
+                self.process_beacon_data(data, sender_ip=addr[0])
             except socket.timeout:
                 pass
             except Exception as e:

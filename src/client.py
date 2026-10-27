@@ -1,19 +1,34 @@
+"""
+AetherDesk Client Network Layer.
+
+Architectural Boundary:
+- Client Runtime Layer: Manages asynchronous network communication, E2EE session key derivation,
+  frame reception, backpressure ACK generation, and task lifecycle (receive loop, reconnect loop, aux tasks).
+- Isolated from GUI thread: Invoked by ClientViewerGUI via threadsafe dispatch (run_coroutine_threadsafe).
+"""
+
 import re
 import time
 import json
 import secrets
 import asyncio
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 import websockets
+try:
+    from websockets.exceptions import ConnectionClosed
+except ImportError:
+    class ConnectionClosed(Exception):
+        pass
 
 import os
 import tempfile
 from pathlib import Path
-from src.security import SecurityManager
+from src.security import SecurityManager, is_test_environment
 from src.protocol import ProtocolMessage
 from src.transfer import ClipboardManager, FileTransferManager
-from src.ota import get_app_version, compute_file_sha256, apply_in_place_update
+from src.ota import get_app_version, compute_file_sha256
+from src.native_engine import get_native_engine, NativeRealtimeEngine
 
 logger = logging.getLogger("RemoteClient")
 
@@ -23,6 +38,9 @@ class ClientSettings:
     def __init__(self, config_dir: Optional[str] = None):
         if config_dir:
             self.config_dir = Path(config_dir)
+        elif is_test_environment():
+            self._test_temp_dir = tempfile.TemporaryDirectory(prefix="aether_test_client_cfg_")
+            self.config_dir = Path(self._test_temp_dir.name)
         else:
             appdata = Path(os.environ.get("APPDATA", os.path.expanduser("~")))
             legacy = appdata / "RemoteDesktopClient"
@@ -166,11 +184,22 @@ class ClientState:
 class RemoteClient:
     """Network client for connecting to a remote host via ID & password."""
 
-    def __init__(self, broker_url: str = "ws://127.0.0.1:8765", auto_lan_discovery: bool = False):
+    def __init__(
+        self,
+        broker_url: str = "ws://127.0.0.1:8765",
+        auto_lan_discovery: bool = False,
+        ws_connector: Optional[Any] = None,
+        security: Optional[SecurityManager] = None,
+        config_dir: Optional[str] = None,
+        dpapi_engine: Optional[Any] = None,
+    ):
         self.broker_url = broker_url
         self.auto_lan_discovery = auto_lan_discovery
+        self.ws_connector = ws_connector
         self.state = ClientState()
-        self.security = SecurityManager()
+        self.security = security or SecurityManager(config_dir=config_dir, dpapi_engine=dpapi_engine)
+        self.settings = ClientSettings(config_dir=config_dir)
+        self.native_engine: NativeRealtimeEngine = get_native_engine()
         self.clipboard = ClipboardManager()
         self.file_transfer = FileTransferManager()
         self.websocket = None
@@ -178,6 +207,10 @@ class RemoteClient:
         self.on_status_callback: Optional[Callable[[str], None]] = None
         self.on_clipboard_callback: Optional[Callable[[str], None]] = None
         self.on_file_saved_callback: Optional[Callable[[str], None]] = None
+        self.on_error_callback: Optional[Callable[[str, dict], None]] = None
+        self.on_verify_fingerprint_callback: Optional[Callable[[str, str], bool]] = None
+        self.on_disconnect_callback: Optional[Callable[[], None]] = None
+        self._webrtc_active: bool = False
         self.on_ota_info_callback: Optional[Callable[[dict], None]] = None
         self.on_ota_progress_callback: Optional[Callable[[int, int], None]] = None
         self.on_ota_complete_callback: Optional[Callable[[bool, str], None]] = None
@@ -191,6 +224,17 @@ class RemoteClient:
         self.last_password = ""
         self.auto_reconnect = True
         self.max_reconnect_attempts = 10
+        self._receive_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._aux_tasks: set[asyncio.Task] = set()
+        self._is_manual_disconnect: bool = False
+        self._disconnect_lock: Optional[asyncio.Lock] = None
+
+    def _track_aux_task(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._aux_tasks.add(task)
+        task.add_done_callback(self._aux_tasks.discard)
+        return task
 
     def _set_status(self, text: str):
         if self.on_status_callback:
@@ -235,20 +279,29 @@ class RemoteClient:
         self.last_dev_id = device_id
         self.last_password = password
         self.auto_reconnect = True
+        self._is_manual_disconnect = False
         self.state.set_connecting(True)
         self._set_status(f"Connessione a {self.broker_url}...")
 
         try:
-            # Enforce 4.0s connection timeout so the client never hangs indefinitely
-            self.websocket = await asyncio.wait_for(
-                websockets.connect(self.broker_url, open_timeout=4.0, max_size=16 * 1024 * 1024),
-                timeout=5.0
-            )
+            if self.ws_connector:
+                conn_target = self.ws_connector()
+                if asyncio.iscoroutine(conn_target):
+                    conn_target = await conn_target
+                self.websocket = conn_target
+            else:
+                # Enforce 4.0s connection timeout so the client never hangs indefinitely
+                self.websocket = await asyncio.wait_for(
+                    websockets.connect(self.broker_url, open_timeout=4.0, max_size=16 * 1024 * 1024),
+                    timeout=5.0
+                )
             # 1. Ask broker to connect to host ID
             salt = secrets.token_bytes(16)
+            client_pubkey_hex = self.security.get_identity_public_key_hex()
             conn_msg = ProtocolMessage.serialize("CONNECT_CLIENT", {
                 "device_id": clean_id,
-                "salt": salt.hex()
+                "salt": salt.hex(),
+                "client_pubkey": client_pubkey_hex
             })
             await self.websocket.send(conn_msg)
 
@@ -262,21 +315,97 @@ class RemoteClient:
                 await self.websocket.close()
                 return False
 
+            if msg_type == "HOST_BUSY":
+                self.state.set_connecting(False)
+                self._set_status(f"Dispositivo {clean_id} occupato in un'altra sessione.")
+                await self.websocket.close()
+                return False
+
             if msg_type == "HOST_FOUND":
                 self.security.reset_replay_window()
                 self._set_status("Computer trovato. Autenticazione...")
+
+                # End-to-end host public key verification against persistent known_hosts (TOFU + explicit pairing)
+                host_pubkey_hex = payload.get("host_pubkey", "")
+                if not host_pubkey_hex:
+                    logger.error(f"Host {clean_id} did not provide public key!")
+                    self.state.set_connecting(False)
+                    self._set_status("ATTENZIONE DI SICUREZZA: L'host non ha fornito la chiave crittografica d'identità.")
+                    await self.websocket.close()
+                    return False
+
+                pin_status, fingerprint = self.security.check_host_pin_status(clean_id, host_pubkey_hex)
+                if pin_status == "KEY_CHANGED":
+                    logger.critical(f"SECURITY ALERT: Host identity mismatch for {clean_id}! Fingerprint: {fingerprint}")
+                    self.state.set_connecting(False)
+                    self._set_status("ATTENZIONE DI SICUREZZA: Chiave host cambiata! Possibile attacco MITM o broker compromesso.")
+                    await self.websocket.close()
+                    return False
+                elif pin_status == "UNPINNED":
+                    logger.info(f"First-time pairing with host {clean_id}. Fingerprint: {fingerprint}")
+                    if not self.on_verify_fingerprint_callback:
+                        logger.error(f"First pairing rejected: no verification callback provided for host {clean_id}")
+                        self.state.set_connecting(False)
+                        self._set_status(f"Connessione rifiutata: verifica fingerprint {fingerprint} richiesta ma nessun gestore di conferma disponibile.")
+                        await self.websocket.close()
+                        return False
+
+                    verified = False
+                    try:
+                        verified = bool(self.on_verify_fingerprint_callback(clean_id, fingerprint))
+                    except Exception as e:
+                        logger.error(f"Fingerprint callback error: {e}")
+                        verified = False
+
+                    if not verified:
+                        logger.warning(f"User rejected or canceled fingerprint verification for host {clean_id}")
+                        self.state.set_connecting(False)
+                        self._set_status(f"Connessione annullata: fingerprint {fingerprint} non confermato.")
+                        await self.websocket.close()
+                        return False
+
+                    pinned = self.security.pin_host_key(clean_id, host_pubkey_hex)
+                    if not pinned:
+                        logger.error(f"Failed to pin host key for {clean_id}")
+                        self.state.set_connecting(False)
+                        self._set_status("Errore interno durante il salvataggio della chiave host.")
+                        await self.websocket.close()
+                        return False
+                elif pin_status not in ("VERIFIED", "PINNED_OK"):
+                    logger.error(f"Invalid host key or pin status for {clean_id}: {pin_status}")
+                    self.state.set_connecting(False)
+                    self._set_status("Errore di validazione crittografica della chiave host.")
+                    await self.websocket.close()
+                    return False
+
+                # Also update devices list in settings
+                saved_devs = self.settings.get_devices()
+                for d in saved_devs:
+                    if ClientState.clean_id(d.get("id", "")) == clean_id:
+                        d["pinned_pubkey"] = host_pubkey_hex.lower()
+                        self.settings.save_device(clean_id, d.get("name", ""), password, self.broker_url)
+                        break
+
+                # Generate Ephemeral X25519 ECDH keypair
+                client_eph_priv, client_eph_pub = self.security.create_ephemeral_ecdh()
+
                 # Derive session key with entered password and host salt
                 host_salt_hex = payload.get("host_salt", "")
                 host_salt = bytes.fromhex(host_salt_hex) if host_salt_hex else b""
                 master_key = self.security.derive_master_key(password, host_salt) if host_salt else password.encode("utf-8")
                 session_key = self.security.derive_session_key(master_key, salt)
 
-                # Send authentication challenge token
+                # Send authentication challenge token with forward-secure ephemeral ECDH
                 auth_token = self.security.encrypt_packet(b"AETHER_AUTH_V1", session_key)
-                auth_req = ProtocolMessage.serialize("AUTH_REQUEST", {"salt": salt.hex(), "target_id": clean_id}, binary_data=auth_token)
+                auth_req = ProtocolMessage.serialize("AUTH_REQUEST", {
+                    "salt": salt.hex(),
+                    "target_id": clean_id,
+                    "client_eph": client_eph_pub.hex(),
+                }, binary_data=auth_token)
                 await self.websocket.send(auth_req)
 
                 # Validate host response (drain any stale in-flight messages until AUTH_OK or AUTH_FAILED)
+                established_session_key = session_key
                 try:
                     for _ in range(6):
                         auth_resp_raw = await asyncio.wait_for(self.websocket.recv(), timeout=3.5)
@@ -287,26 +416,69 @@ class RemoteClient:
                             await self.websocket.close()
                             return False
                         elif auth_type == "AUTH_OK":
+                            # Check if host responded with forward-secure X25519 parameters
+                            host_eph_hex = auth_payload.get("host_eph")
+                            host_sig_hex = auth_payload.get("host_sig")
+                            if host_eph_hex and host_sig_hex and host_pubkey_hex:
+                                host_eph_bytes = bytes.fromhex(host_eph_hex)
+                                host_sig_bytes = bytes.fromhex(host_sig_hex)
+                                host_pub_bytes = bytes.fromhex(host_pubkey_hex)
+                                valid_sig = SecurityManager.verify_data_signature(
+                                    host_pub_bytes, host_eph_bytes + client_eph_pub + salt, host_sig_bytes
+                                )
+                                if not valid_sig:
+                                    logger.error("Host cryptographic signature on ephemeral key is invalid!")
+                                    self.state.set_connecting(False)
+                                    self._set_status("ATTENZIONE DI SICUREZZA: Firma dell'host non valida!")
+                                    await self.websocket.close()
+                                    return False
+                                # Derive forward-secure ECDH key
+                                established_session_key = self.security.derive_ecdh_shared_key(
+                                    client_eph_priv, host_eph_bytes, salt, context=b"AetherDesk-v2-ForwardSecure"
+                                )
+                                logger.info("Forward-secure X25519 + Ed25519 session established successfully.")
+
+                            # Handle WebRTC offer with real native client peer connection
+                            webrtc_offer = auth_payload.get("webrtc_offer")
+                            if webrtc_offer and self.native_engine.is_native_loaded:
+                                logger.info("Host offered WebRTC session. Initializing real client peer connection...")
+                                if self.native_engine.create_client_session():
+                                    if self.native_engine.set_client_offer(webrtc_offer):
+                                        ans_sdp = self.native_engine.create_client_answer()
+                                        if ans_sdp:
+                                            ans_msg = ProtocolMessage.serialize("WEBRTC_ANSWER", {"sdp": ans_sdp})
+                                            await self.websocket.send(ans_msg)
+                                            logger.info("Sent real negotiated WebRTC Answer to host.")
+                            else:
+                                self._webrtc_active = False
                             break
                         elif auth_type == "FRAME" and auth_bin:
                             try:
-                                first_jpeg = self.security.decrypt_packet(auth_bin, session_key, check_replay=False)
+                                first_jpeg = self.security.decrypt_packet(auth_bin, established_session_key, check_replay=False)
                                 break
                             except Exception:
                                 pass
                 except asyncio.TimeoutError:
                     pass
 
-                self.state.set_connected(True, session_key)
+                self.state.set_connected(True, established_session_key)
                 self.state.target_id = clean_id
                 self._set_status("Connesso con successo!")
 
-                # Start background receiver loop
-                asyncio.create_task(self._receive_loop())
+                # Cancel previous receive loop if running
+                if self._receive_task and not self._receive_task.done():
+                    self._receive_task.cancel()
+                    try:
+                        await self._receive_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                # Start background receiver loop tracked
+                self._receive_task = asyncio.create_task(self._receive_loop())
                 # Query host for OTA update availability
-                asyncio.create_task(self.check_ota_update())
+                self._track_aux_task(self.check_ota_update())
                 # Request list of available physical monitors on remote host
-                asyncio.create_task(self.request_monitors_list())
+                self._track_aux_task(self.request_monitors_list())
                 return True
 
         except asyncio.TimeoutError:
@@ -340,52 +512,98 @@ class RemoteClient:
         return False
 
     async def _receive_loop(self):
-        """Listen for incoming encrypted video frames from the host."""
-        try:
+        """Listen for incoming encrypted video frames and WebRTC peer connection packets."""
+        async def _ws_receiver():
             while self.state.is_connected and self.websocket:
                 raw = await self.websocket.recv()
                 msg_type, payload, binary = ProtocolMessage.deserialize(raw)
 
-                if msg_type == "FRAME" and binary and self.state.session_key:
+                if msg_type == "ICE_CANDIDATE":
+                    cand = payload.get("candidate", "") if isinstance(payload, dict) else ""
+                    if cand and self.native_engine.is_native_loaded and self.native_engine.client_handle:
+                        self.native_engine.add_client_ice_candidate(cand)
+
+                elif msg_type == "FRAME" and binary and self.state.session_key:
+                    t_recv = time.time()
+                    # Backpressure / Flow control: send FRAME_ACK immediately to prevent bufferbloat
+                    fid = payload.get("fid", 0) if isinstance(payload, dict) else 0
+                    ack_msg = ProtocolMessage.serialize("FRAME_ACK", {"fid": fid, "target_id": self.state.target_id})
                     try:
-                        t_recv = time.time()
-                        # Backpressure / Flow control: send FRAME_ACK immediately to prevent bufferbloat
-                        fid = payload.get("fid", 0)
-                        ack_msg = ProtocolMessage.serialize("FRAME_ACK", {"fid": fid, "target_id": self.state.target_id})
-                        asyncio.create_task(self.websocket.send(ack_msg))
+                        await self.websocket.send(ack_msg)
+                    except Exception as ack_err:
+                        logger.debug(f"Failed to send FRAME_ACK: {ack_err}")
 
-                        t_dec_start = time.perf_counter_ns()
+                    # 1. Decrypt packet with targeted error handling
+                    t_dec_start = time.perf_counter_ns()
+                    try:
                         jpeg_bytes = self.security.decrypt_packet(binary, self.state.session_key, check_replay=False)
-                        t_dec_ms = round((time.perf_counter_ns() - t_dec_start) / 1e6, 2)
-
-                        size = (payload.get("w", 1920), payload.get("h", 1080))
-                        cur = (payload.get("cx", 0), payload.get("cy", 0))
-                        self.state.host_dims = size
-
-                        telemetry = {
-                            "fid": fid,
-                            "t_send": payload.get("t_send", 0.0),
-                            "t_recv": t_recv,
-                            "cap_ms": payload.get("cap_ms", 0.0),
-                            "enc_ms": payload.get("enc_ms", 0.0),
-                            "dec_ms": t_dec_ms,
-                            "size_bytes": len(binary)
-                        }
-
-                        if self.on_frame_callback:
-                            try:
-                                self.on_frame_callback(jpeg_bytes, size, cur, telemetry)
-                            except TypeError:
-                                self.on_frame_callback(jpeg_bytes, size, cur)
                         self._decrypt_failures = 0
-                    except Exception as e:
-                        logger.error(f"Frame decrypt error: {e}")
+                    except Exception as dec_err:
+                        logger.error(f"Frame decrypt error: {dec_err}")
                         self._decrypt_failures = getattr(self, "_decrypt_failures", 0) + 1
                         if self._decrypt_failures >= 3:
                             self._set_status("Password errata o chiave di sessione non valida.")
                             if self.on_status_callback:
                                 self.on_status_callback("Password errata. Impossibile decifrare il video.")
-                            asyncio.create_task(self.disconnect())
+                            self._is_manual_disconnect = True
+                            self.auto_reconnect = False
+                            self.state.set_connected(False)
+                            self._webrtc_active = False
+                            if self.on_disconnect_callback:
+                                try:
+                                    self.on_disconnect_callback()
+                                except Exception:
+                                    pass
+                            break
+                        continue
+
+                    t_dec_ms = round((time.perf_counter_ns() - t_dec_start) / 1e6, 2)
+                    size = (payload.get("w", 1920), payload.get("h", 1080)) if isinstance(payload, dict) else (1920, 1080)
+                    cur = (payload.get("cx", 0), payload.get("cy", 0)) if isinstance(payload, dict) else (0, 0)
+                    self.state.host_dims = size
+
+                    # 2. Telemetry extraction with strict non-breaking isolation
+                    telemetry = {
+                        "fid": fid,
+                        "t_send": payload.get("t_send") if isinstance(payload, dict) else None,
+                        "t_recv": t_recv,
+                        "cap_ms": payload.get("cap_ms") if isinstance(payload, dict) else None,
+                        "enc_ms": payload.get("enc_ms") if isinstance(payload, dict) else None,
+                        "dec_ms": t_dec_ms,
+                        "rtt_ms": None,
+                        "clock_offset_ms": None,
+                        "jitter_ms": None,
+                        "size_bytes": len(binary),
+                        "webrtc": False,
+                    }
+                    try:
+                        host_rtt = payload.get("rtt_ms") if isinstance(payload, dict) else None
+                        if host_rtt is not None and isinstance(host_rtt, (int, float)) and host_rtt > 0:
+                            telemetry["rtt_ms"] = round(float(host_rtt), 2)
+                        elif hasattr(self, "native_engine") and self.native_engine and hasattr(self.native_engine, "clock_estimator"):
+                            est_rtt = self.native_engine.clock_estimator.rtt_ms
+                            if est_rtt is not None and isinstance(est_rtt, (int, float)) and est_rtt > 0:
+                                telemetry["rtt_ms"] = round(float(est_rtt), 2)
+                            est_offset = self.native_engine.clock_estimator.offset_ms
+                            if est_offset is not None and isinstance(est_offset, (int, float)) and telemetry["rtt_ms"] is not None:
+                                telemetry["clock_offset_ms"] = round(float(est_offset), 3)
+                            est_jitter = self.native_engine.clock_estimator.jitter_ms
+                            if est_jitter is not None and isinstance(est_jitter, (int, float)) and telemetry["rtt_ms"] is not None:
+                                telemetry["jitter_ms"] = round(float(est_jitter), 2)
+                    except Exception as telem_err:
+                        logger.debug(f"Telemetry extraction error (non-fatal): {telem_err}")
+
+                    # 3. Always dispatch frame callback regardless of telemetry availability
+                    if self.on_frame_callback:
+                        try:
+                            self.on_frame_callback(jpeg_bytes, size, cur, telemetry)
+                        except TypeError:
+                            try:
+                                self.on_frame_callback(jpeg_bytes, size, cur)
+                            except Exception as cb_err:
+                                logger.error(f"Error in on_frame_callback (fallback signature): {cb_err}")
+                        except Exception as cb_err:
+                            logger.error(f"Error in on_frame_callback: {cb_err}")
 
                 elif msg_type == "CLIPBOARD" and binary and self.state.session_key:
                     try:
@@ -401,6 +619,43 @@ class RemoteClient:
                     saved_path = payload.get("saved_path", "")
                     if self.on_file_saved_callback:
                         self.on_file_saved_callback(saved_path)
+
+                elif msg_type in ("ERROR", "INPUT_ERROR", "INPUT_REJECTED"):
+                    err_code = payload.get("error", "unknown_error")
+                    err_message = payload.get("message", "")
+                    logger.warning(f"Ricevuto errore dall'host: {err_code} ({payload})")
+                    if err_code == "CONTROL_CHANNEL_SATURATED":
+                        self._is_manual_disconnect = True
+                        self.auto_reconnect = False
+                        self._set_status("Sessione terminata: canale di controllo host saturo.")
+                        self.state.set_connected(False)
+                        self._webrtc_active = False
+                        if self.on_disconnect_callback:
+                            try:
+                                self.on_disconnect_callback()
+                            except Exception:
+                                pass
+                        break
+                    elif err_code in ("CAPTURE_FAILED", "STREAM_ERROR", "HOST_STREAM_TERMINATED"):
+                        status_str = f"Sessione interrotta: {err_message}" if err_message else f"Sessione interrotta: errore di streaming host ({err_code})."
+                        self._set_status(status_str)
+                        self._is_manual_disconnect = True
+                        self.auto_reconnect = False
+                        self.state.set_connected(False)
+                        self._webrtc_active = False
+                        if self.on_disconnect_callback:
+                            try:
+                                self.on_disconnect_callback()
+                            except Exception:
+                                pass
+                        break
+                    else:
+                        self._set_status(f"Errore host: {err_code}")
+                    if self.on_error_callback:
+                        try:
+                            self.on_error_callback(err_code, payload)
+                        except Exception:
+                            pass
 
                 elif msg_type == "MONITORS_LIST":
                     mons = payload.get("monitors", [])
@@ -448,19 +703,18 @@ class RemoteClient:
                         except Exception:
                             pass
                         self._ota_fp = None
-                    expected_sha = payload.get("sha256", self._ota_sha256)
                     if self._ota_temp_file and Path(self._ota_temp_file).exists():
-                        actual_sha = compute_file_sha256(self._ota_temp_file)
-                        if expected_sha and actual_sha.lower() != expected_sha.lower():
-                            if self.on_ota_complete_callback:
-                                self.on_ota_complete_callback(False, f"Checksum SHA-256 non valido (Atteso: {expected_sha[:8]}..., Calcolato: {actual_sha[:8]}...).")
-                        else:
-                            ok, msg = apply_in_place_update(self._ota_temp_file, target_version=payload.get("version"))
-                            if self.on_ota_complete_callback:
-                                self.on_ota_complete_callback(ok, msg)
-                    else:
-                        if self.on_ota_complete_callback:
-                            self.on_ota_complete_callback(False, "File OTA non trovato.")
+                        try:
+                            os.unlink(self._ota_temp_file)
+                        except Exception:
+                            pass
+                        self._ota_temp_file = None
+                    logger.warning("OTA_FINISH ricevuto da peer: aggiornamento P2P respinto fail-closed (manca firma digitale fornitore).")
+                    if self.on_ota_complete_callback:
+                        self.on_ota_complete_callback(
+                            False,
+                            "Rifiuto OTA P2P fail-closed: il file trasmesso dall'host non possiede una firma digitale del fornitore verificabile."
+                        )
 
                 elif msg_type == "OTA_ERROR":
                     if self._ota_fp:
@@ -475,35 +729,183 @@ class RemoteClient:
 
                 elif msg_type == "CLIENT_DISCONNECTED":
                     logger.info("Host disconnected from broker.")
+                    self._is_manual_disconnect = True
+                    self.auto_reconnect = False
                     self.state.set_connected(False)
+                    self._webrtc_active = False
                     self._set_status("Il computer remoto si e' disconnesso.")
                     if self.on_status_callback:
                         self.on_status_callback("Il computer remoto si e' disconnesso.")
+                    if self.on_disconnect_callback:
+                        try:
+                            self.on_disconnect_callback()
+                        except Exception:
+                            pass
                     break
 
-        except (websockets.exceptions.ConnectionClosed, Exception) as e:
-            logger.warning(f"Connection lost: {e}")
-            if self.auto_reconnect and self.last_dev_id and not self.state.is_reconnecting:
-                asyncio.create_task(self._attempt_reconnection())
-            else:
-                self.state.set_connected(False)
-                self._set_status("Connessione interrotta dal computer remoto.")
+        async def _webrtc_pump():
+            while self.state.is_connected:
+                if self.native_engine.is_native_loaded and self.native_engine.client_handle:
+                    # 1. Forward outgoing local ICE candidates to host via broker
+                    cand = self.native_engine.poll_client_ice_candidate()
+                    if cand and self.websocket:
+                        try:
+                            cand_msg = ProtocolMessage.serialize("ICE_CANDIDATE", {
+                                "target_id": self.state.target_id,
+                                "candidate": cand
+                            })
+                            await self.websocket.send(cand_msg)
+                        except Exception as cand_err:
+                            logger.debug(f"Failed to forward client ICE candidate: {cand_err}")
+
+                    # 2. Monitor ICE connection state
+                    ice_state = self.native_engine.get_client_ice_state()
+                    if ice_state in (2, 3):  # Connected or Completed
+                        if not self._webrtc_active:
+                            self._webrtc_active = True
+                            logger.info("Client WebRTC P2P direct transport activated (ICE connected).")
+                    elif ice_state in (4, 5, 6):  # Failed, Disconnected, or Closed
+                        if self._webrtc_active:
+                            self._webrtc_active = False
+                            logger.warning(f"Client WebRTC ICE state {ice_state}, falling back to WebSocket stream.")
+
+                    # 3. Poll decoded video frame from native pipeline
+                    if self._webrtc_active:
+                        frame_res = self.native_engine.poll_client_video_frame()
+                        if frame_res:
+                            raw_bytes, dims, dec_ms = frame_res
+                            self.state.host_dims = dims
+                            rtt_measured = round(self.native_engine.clock_estimator.rtt_ms, 2) if self.native_engine.clock_estimator.rtt_ms > 0 else None
+                            clock_offset = round(self.native_engine.clock_estimator.offset_ms, 3) if self.native_engine.clock_estimator.rtt_ms > 0 else None
+                            jitter_measured = round(self.native_engine.clock_estimator.jitter_ms, 2) if self.native_engine.clock_estimator.rtt_ms > 0 else None
+
+                            telemetry = {
+                                "fid": None,
+                                "t_send": None,
+                                "t_recv": time.time(),
+                                "cap_ms": None,
+                                "enc_ms": None,
+                                "dec_ms": dec_ms if dec_ms > 0 else None,
+                                "rtt_ms": rtt_measured,
+                                "clock_offset_ms": clock_offset,
+                                "jitter_ms": jitter_measured,
+                                "size_bytes": len(raw_bytes),
+                                "webrtc": True,
+                            }
+                            if self.on_frame_callback:
+                                try:
+                                    self.on_frame_callback(raw_bytes, dims, (0, 0), telemetry)
+                                except TypeError:
+                                    self.on_frame_callback(raw_bytes, dims, (0, 0))
+
+                await asyncio.sleep(0.005)
+
+        receiver_task = None
+        pump_task = None
+        should_schedule_disconnect = False
+        try:
+            receiver_task = asyncio.create_task(_ws_receiver())
+            pump_task = asyncio.create_task(_webrtc_pump())
+
+            try:
+                done, pending = await asyncio.wait(
+                    [receiver_task, pump_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                # Terminate and gather whichever sibling task is still pending
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                # Propagate any exception from completed tasks
+                for t in done:
+                    if not t.cancelled() and t.exception():
+                        raise t.exception()
+
+                # If completed without exceptions, check if an inbound terminal message
+                # marked the session as terminated (e.g. CLIENT_DISCONNECTED, SATURATED, CAPTURE_FAILED)
+                if not self.state.is_connected and not self.state.is_reconnecting:
+                    should_schedule_disconnect = True
+            except asyncio.CancelledError:
+                # Intentional cancellation during external disconnect() or reconnect cleanup.
+                # Do NOT schedule teardown: the cancelling task owns the teardown.
+                should_schedule_disconnect = False
+                raise
+            except (ConnectionClosed, Exception) as e:
+                logger.warning(f"Connection lost: {e}")
+                if self.auto_reconnect and self.last_dev_id and not self.state.is_reconnecting and not self._is_manual_disconnect:
+                    # Hand over lifecycle to reconnection task; teardown is deferred to reconnect outcome
+                    if self._reconnect_task and not self._reconnect_task.done():
+                        self._reconnect_task.cancel()
+                    self._reconnect_task = asyncio.create_task(self._attempt_reconnection())
+                    should_schedule_disconnect = False
+                else:
+                    self._is_manual_disconnect = True
+                    self.auto_reconnect = False
+                    self.state.set_connected(False)
+                    self._webrtc_active = False
+                    self._set_status("Connessione interrotta dal computer remoto.")
+                    if self.on_disconnect_callback:
+                        try:
+                            self.on_disconnect_callback()
+                        except Exception:
+                            pass
+                    should_schedule_disconnect = True
+        finally:
+            # Guarantee that both child tasks are cancelled and awaited before _receive_loop exits
+            child_tasks = [t for t in (receiver_task, pump_task) if t is not None]
+            for t in child_tasks:
+                if not t.done():
+                    t.cancel()
+            if child_tasks:
+                await asyncio.gather(*child_tasks, return_exceptions=True)
+
+            if self._ota_fp:
+                try:
+                    self._ota_fp.close()
+                except Exception:
+                    pass
+                self._ota_fp = None
+
+            # Schedule definitive teardown exactly once if receive loop owned the termination
+            if should_schedule_disconnect and not self.state.is_reconnecting:
+                self._track_aux_task(self.disconnect())
 
     async def _attempt_reconnection(self):
         self.state.set_reconnecting(True)
-        for attempt in range(1, self.max_reconnect_attempts + 1):
-            self._set_status(f"Connessione persa. Riconnessione in corso... ({attempt}/{self.max_reconnect_attempts})")
-            await asyncio.sleep(2.0)
-            try:
-                ok = await self.connect(self.last_dev_id, self.last_password)
-                if ok:
-                    self._set_status("Riconnesso con successo!")
-                    return
-            except Exception:
-                pass
-        self.state.set_reconnecting(False)
-        self.state.set_connected(False)
-        self._set_status("Impossibile riconnettersi al computer remoto.")
+        try:
+            for attempt in range(1, self.max_reconnect_attempts + 1):
+                if self._is_manual_disconnect or not self.auto_reconnect:
+                    break
+                self._set_status(f"Connessione persa. Riconnessione in corso... ({attempt}/{self.max_reconnect_attempts})")
+                await asyncio.sleep(2.0)
+                if self._is_manual_disconnect or not self.auto_reconnect:
+                    break
+                try:
+                    ok = await self.connect(self.last_dev_id, self.last_password)
+                    if ok:
+                        self._set_status("Riconnesso con successo!")
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.state.set_reconnecting(False)
+            if not self.state.is_connected:
+                self._set_status("Impossibile riconnettersi al computer remoto.")
+                if not self._is_manual_disconnect:
+                    self._is_manual_disconnect = True
+                    self.auto_reconnect = False
+                    if self.on_disconnect_callback:
+                        try:
+                            self.on_disconnect_callback()
+                        except Exception:
+                            pass
+                    self._track_aux_task(self.disconnect())
 
     async def toggle_privacy_mode(self, enabled: bool):
         """Turn on/off physical monitor on host PC."""
@@ -579,13 +981,50 @@ class RemoteClient:
         return True
 
     async def send_input(self, input_dict: dict):
-        """Encrypt and send mouse/keyboard input to host."""
-        if not self.state.is_connected or not self.websocket or not self.state.session_key:
+        """Encrypt and send mouse/keyboard input to host over segregated channels."""
+        if not self.state.is_connected or not self.state.session_key:
             return
+
+        # Segregated transport: when native WebRTC is active, route through dedicated channels
+        if self._webrtc_active and self.native_engine.is_native_loaded and self.native_engine.client_handle:
+            if input_dict.get("type") == "mouse_move":
+                self._cursor_seq = getattr(self, "_cursor_seq", 0) + 1
+                seq = self._cursor_seq
+                norm_x = float(input_dict.get("x", 0.0))
+                norm_y = float(input_dict.get("y", 0.0))
+                w, h = self.state.host_dims
+                px = int(norm_x * w) if norm_x <= 1.0 else int(norm_x)
+                py = int(norm_y * h) if norm_y <= 1.0 else int(norm_y)
+                if self.native_engine.send_client_cursor(px, py, seq):
+                    return
+            else:
+                payload_bytes = json.dumps(input_dict).encode("utf-8")
+                enc_payload = self.security.encrypt_packet(payload_bytes, self.state.session_key)
+                ctrl_packet = ProtocolMessage.serialize("INPUT", {
+                    "target_id": self.state.target_id,
+                    "channel": "control"
+                }, binary_data=enc_payload)
+                if self.native_engine.send_client_control(ctrl_packet):
+                    return
+
+        # Fallback to WebSocket signaling transport when WebRTC is not active
+        if not self.websocket:
+            return
+
+        if input_dict.get("type") == "mouse_move":
+            self._cursor_seq = getattr(self, "_cursor_seq", 0) + 1
+            input_dict["seq"] = self._cursor_seq
+            input_dict["t"] = time.perf_counter_ns()
+            channel_priority = "cursor"
+        else:
+            channel_priority = "control"
 
         payload_bytes = json.dumps(input_dict).encode("utf-8")
         encrypted = self.security.encrypt_packet(payload_bytes, self.state.session_key)
-        msg = ProtocolMessage.serialize("INPUT", {"target_id": self.state.target_id}, binary_data=encrypted)
+        msg = ProtocolMessage.serialize("INPUT", {
+            "target_id": self.state.target_id,
+            "channel": channel_priority
+        }, binary_data=encrypted)
         try:
             await self.websocket.send(msg)
         except Exception as e:
@@ -615,9 +1054,75 @@ class RemoteClient:
             logger.warning(f"Failed to send OTA_REQUEST: {e}")
 
     async def disconnect(self):
-        self.auto_reconnect = False
-        self.state.set_connected(False)
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
-        self._set_status("Disconnesso.")
+        """
+        Safely and idempotently terminate the client connection, teardown WebRTC/native
+        pipelines, cancel background receiver loops and aux tasks without self-cancellation.
+        Serialized through _disconnect_lock to prevent race conditions from concurrent disconnect triggers.
+        """
+        if self._disconnect_lock is None:
+            self._disconnect_lock = asyncio.Lock()
+
+        cur_task = asyncio.current_task()
+        if cur_task is not None and cur_task is self._receive_task and self._disconnect_lock.locked():
+            # Disconnect is already in progress by another task (e.g. GUI); prevent circular deadlock
+            self._is_manual_disconnect = True
+            self.auto_reconnect = False
+            self.state.set_connected(False)
+            self.state.set_reconnecting(False)
+            self.state.set_connecting(False)
+            self._webrtc_active = False
+            return
+
+        async with self._disconnect_lock:
+            self._is_manual_disconnect = True
+            self.auto_reconnect = False
+            self.state.set_connected(False)
+            self.state.set_reconnecting(False)
+            self.state.set_connecting(False)
+            self._webrtc_active = False
+
+            if hasattr(self, "native_engine") and self.native_engine and self.native_engine.is_native_loaded:
+                try:
+                    self.native_engine.destroy_client_session()
+                except Exception as e:
+                    logger.debug(f"Error destroying client native session: {e}")
+
+            cur_task = asyncio.current_task()
+
+            # Cancel reconnect task if active and not current task
+            if self._reconnect_task and not self._reconnect_task.done() and self._reconnect_task is not cur_task:
+                self._reconnect_task.cancel()
+                try:
+                    await self._reconnect_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._reconnect_task = None
+
+            # Cancel receive loop if active and not current task
+            if self._receive_task and not self._receive_task.done() and self._receive_task is not cur_task:
+                self._receive_task.cancel()
+                try:
+                    await self._receive_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._receive_task = None
+
+            # Cancel auxiliary tasks (excluding current task to avoid self-cancellation during teardown!)
+            other_tasks = [t for t in list(self._aux_tasks) if t is not cur_task and not t.done()]
+            for task in other_tasks:
+                task.cancel()
+            if other_tasks:
+                try:
+                    await asyncio.gather(*other_tasks, return_exceptions=True)
+                except Exception:
+                    pass
+
+            self._aux_tasks.clear()
+
+            if self.websocket:
+                try:
+                    await self.websocket.close()
+                except Exception:
+                    pass
+                self.websocket = None
+            self._set_status("Disconnesso.")

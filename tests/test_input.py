@@ -1,36 +1,67 @@
 import pytest
-from src.input_handler import InputHandler
+from src.input_handler import InputHandler, MockInputInjector
 
 def test_input_handler_coordinates():
-    handler = InputHandler()
+    mock_inj = MockInputInjector(screen_w=1920, screen_h=1080)
+    handler = InputHandler(injector=mock_inj)
     abs_x, abs_y = handler.normalize_to_screen(0.5, 0.5)
     assert abs_x > 0 and abs_y > 0
 
 def test_input_handler_mouse_events():
-    handler = InputHandler()
-    # Test valid calls don't raise
+    mock_inj = MockInputInjector(screen_w=1920, screen_h=1080)
+    handler = InputHandler(injector=mock_inj)
+    # Test valid calls don't raise and are recorded safely in mock
     handler.move_mouse(0.1, 0.1)
     handler.mouse_down("left", norm_x=0.2, norm_y=0.2)
+    assert "left" in handler._pressed_mouse_buttons
     handler.mouse_up("left", norm_x=0.2, norm_y=0.2)
+    assert "left" not in handler._pressed_mouse_buttons
     handler.mouse_down("right", norm_x=0.3, norm_y=0.3)
+    assert "right" in handler._pressed_mouse_buttons
     handler.mouse_up("right", norm_x=0.3, norm_y=0.3)
+    assert "right" not in handler._pressed_mouse_buttons
     handler.mouse_wheel(120, norm_x=0.2, norm_y=0.2)
+    assert len(mock_inj.sent_inputs) > 0
 
 def test_input_handler_keyboard_events():
-    handler = InputHandler()
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
     handler.key_down(0x41) # 'A'
+    assert 0x41 in handler._pressed_keys
     handler.key_up(0x41)
+    assert 0x41 not in handler._pressed_keys
     handler.send_unicode_char("€")
     handler.send_unicode_char("à")
+    assert len(mock_inj.sent_inputs) > 0
 
 def test_input_handler_special_keys():
-    handler = InputHandler()
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
+    # Verify special system actions without touching real OS session or windows
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("win_d") is True
+    assert len(mock_inj.sent_inputs) >= 2 # Win + D (down/up)
+
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("alt_tab") is True
+    assert len(mock_inj.sent_inputs) >= 2 # Alt + Tab
+
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("task_mgr") is True
+    assert len(mock_inj.sent_inputs) >= 3 # Ctrl + Shift + Esc
+
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("lock") is True
+    assert len(mock_inj.sent_inputs) >= 2 # Win + L (down/up)
+
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("copy") is True
+    assert len(mock_inj.sent_inputs) >= 2 # Ctrl + C
+
+    mock_inj.sent_inputs.clear()
     assert handler.send_special("paste") is True
+    assert len(mock_inj.sent_inputs) >= 2 # Ctrl + V
+
     assert handler.send_special("select_all") is True
     assert handler.send_special("enter") is True
     assert handler.send_special("backspace") is True
@@ -39,17 +70,30 @@ def test_input_handler_special_keys():
     assert handler.send_shortcut("ctrl+shift+esc") is True
 
 def test_input_handler_shortcuts_and_text():
-    handler = InputHandler()
-    # Test typing whole string
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
+    # Test typing whole string via mock injector
+    mock_inj.sent_inputs.clear()
     handler.send_unicode_char("Ciao Mondo!")
+    assert len(mock_inj.sent_inputs) >= len("Ciao Mondo!")
+
     # Test relative move
-    handler.move_mouse_relative(10, -5)
+    new_pos = handler.move_mouse_relative(10, -5)
+    assert new_pos == (10, -5)
+    assert mock_inj.cursor_pos == (10, -5)
+
     # Test click and double click
+    mock_inj.sent_inputs.clear()
     handler.mouse_click("left")
+    assert len(mock_inj.sent_inputs) >= 2 # down + up
+
+    mock_inj.sent_inputs.clear()
     handler.mouse_double_click("left")
+    assert len(mock_inj.sent_inputs) >= 4 # 2x (down + up)
 
 def test_input_handler_raw_pixel_auto_detection():
-    handler = InputHandler()
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
     captured_inputs = []
     handler._send_input = lambda inp: captured_inputs.append((inp.union.mi.dx, inp.union.mi.dy))
 
@@ -71,7 +115,8 @@ def test_input_handler_button_normalization():
     assert normalize_button("unknown") == "left"
 
 def test_input_handler_multimonitor_mapping():
-    handler = InputHandler()
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
     captured_inputs = []
     handler._send_input = lambda inp: captured_inputs.append((inp.union.mi.dx, inp.union.mi.dy))
 
@@ -90,7 +135,8 @@ def test_input_handler_multimonitor_mapping():
     assert abs(abs_y - int(0.5 * 65535)) <= 1
 
 def test_input_handler_release_all_keys():
-    handler = InputHandler()
+    mock_inj = MockInputInjector()
+    handler = InputHandler(injector=mock_inj)
     handler.key_down(0x41)
     handler.key_down(0x11) # Ctrl
     assert 0x41 in handler._pressed_keys

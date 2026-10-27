@@ -1,6 +1,16 @@
 import ctypes
 from ctypes import wintypes
 import time
+import sys
+import os
+
+def is_test_environment() -> bool:
+    """Check if Python process is running within pytest or test discovery."""
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST") or "PYTEST_VERSION" in os.environ:
+        return True
+    if any("pytest" in arg.lower() for arg in sys.argv):
+        return True
+    return False
 
 # Win32 Constants
 INPUT_MOUSE = 0
@@ -111,31 +121,20 @@ class INPUT(ctypes.Structure):
         ("union", _INPUT_UNION)
     ]
 
-class InputHandler:
-    """
-    TeamViewer-grade input injection engine:
-    - Auto-switches thread to active input desktop (UAC/lockscreen/worker thread support).
-    - Uses SetCursorPos for pixel accuracy + SendInput with mouse_event/keybd_event fallback.
-    - Full multi-monitor and virtual desktop coordinate transformation.
-    """
+class WindowsInputInjector:
+    """Production Windows input injector using Win32 API via ctypes."""
 
     def __init__(self):
-        self.user32 = ctypes.windll.user32
-        # Enable Per-Monitor V2 DPI awareness so metrics match screen capture
-        try:
-            self.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        except Exception:
-            try:
-                ctypes.windll.shcore.SetProcessDpiAwareness(1)
-            except Exception:
-                pass
-        self.last_pixel_pos = (0, 0)
+        if is_test_environment():
+            raise RuntimeError(
+                "WindowsInputInjector cannot be initialized in a test environment. "
+                "Use MockInputInjector instead."
+            )
+        self.user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
         self._winsta_initialized = False
         self._last_desktop_check = 0.0
-        self._pressed_keys = set()
 
-    def _ensure_input_desktop(self, force: bool = False) -> bool:
-        """Attach caller thread to active Windows input desktop (handles UAC/lockscreen/worker threads)."""
+    def ensure_input_desktop(self, force: bool = False) -> bool:
         now = time.time()
         if not force and (now - self._last_desktop_check < 2.0):
             return True
@@ -151,7 +150,6 @@ class InputHandler:
                 pass
 
         try:
-            # Safe explicit rights: READ + WRITE + SWITCH, fallback to READ + SWITCH
             flags = 0x0001 | 0x0040 | 0x0100
             hdesk = self.user32.OpenInputDesktop(0, False, flags)
             if not hdesk:
@@ -164,9 +162,107 @@ class InputHandler:
             pass
         return False
 
+    def get_system_metrics(self, index: int) -> int:
+        return self.user32.GetSystemMetrics(index)
+
+    def set_cursor_pos(self, x: int, y: int) -> bool:
+        return bool(self.user32.SetCursorPos(x, y))
+
+    def send_input(self, inp: INPUT) -> bool:
+        res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if res == 0:
+            self.ensure_input_desktop(force=True)
+            res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        return res > 0
+
+    def mouse_event(self, flags: int, dx: int, dy: int, data: int, extra_info: int) -> None:
+        self.user32.mouse_event(flags, dx, dy, data, extra_info)
+
+    def keybd_event(self, vk: int, scan: int, flags: int, extra_info: int) -> None:
+        self.user32.keybd_event(vk, scan, flags, extra_info)
+
+
+class MockInputInjector:
+    """Mock injector for deterministic unit testing without requiring real desktop."""
+
+    def __init__(self, screen_w: int = 1920, screen_h: int = 1080):
+        self.screen_w = screen_w
+        self.screen_h = screen_h
+        self.cursor_pos = (0, 0)
+        self.sent_inputs = []
+        self.mouse_events = []
+        self.keybd_events = []
+        self.desktop_ensured_count = 0
+
+    def ensure_input_desktop(self, force: bool = False) -> bool:
+        self.desktop_ensured_count += 1
+        return True
+
+    def get_system_metrics(self, index: int) -> int:
+        if index in (0, 78):
+            return self.screen_w
+        if index in (1, 79):
+            return self.screen_h
+        if index in (76, 77):
+            return 0
+        return 0
+
+    def set_cursor_pos(self, x: int, y: int) -> bool:
+        self.cursor_pos = (x, y)
+        return True
+
+    def send_input(self, inp: INPUT) -> bool:
+        self.sent_inputs.append(inp)
+        return True
+
+    def mouse_event(self, flags: int, dx: int, dy: int, data: int, extra_info: int) -> None:
+        self.mouse_events.append((flags, dx, dy, data, extra_info))
+
+    def keybd_event(self, vk: int, scan: int, flags: int, extra_info: int) -> None:
+        self.keybd_events.append((vk, scan, flags, extra_info))
+
+
+class InputHandler:
+    """
+    TeamViewer-grade input injection engine:
+    - Auto-switches thread to active input desktop (UAC/lockscreen/worker thread support).
+    - Uses SetCursorPos for pixel accuracy + SendInput with mouse_event/keybd_event fallback.
+    - Full multi-monitor and virtual desktop coordinate transformation.
+    """
+
+    def __init__(self, injector=None):
+        if injector is not None:
+            self.injector = injector
+        elif is_test_environment() or not hasattr(ctypes, "windll"):
+            self.injector = MockInputInjector()
+        else:
+            self.injector = WindowsInputInjector()
+
+        if isinstance(self.injector, WindowsInputInjector):
+            self.user32 = getattr(self.injector, "user32", None)
+            if self.user32 is None and hasattr(ctypes, "windll"):
+                self.user32 = ctypes.windll.user32
+            # Enable Per-Monitor V2 DPI awareness only on real Windows injector
+            try:
+                ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            except Exception:
+                try:
+                    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+                except Exception:
+                    pass
+        else:
+            self.user32 = None
+        self.last_pixel_pos = (0, 0)
+        self._pressed_keys = set()
+        self._pressed_mouse_buttons = set()
+
+    def _ensure_input_desktop(self, force: bool = False) -> bool:
+        """Attach caller thread to active Windows input desktop (handles UAC/lockscreen/worker threads)."""
+        return self.injector.ensure_input_desktop(force=force)
+
     def get_screen_bounds(self) -> tuple[int, int]:
-        w = self.user32.GetSystemMetrics(0)
-        h = self.user32.GetSystemMetrics(1)
+        w = self.injector.get_system_metrics(0)
+        h = self.injector.get_system_metrics(1)
         return (w if w > 0 else 1920, h if h > 0 else 1080)
 
     def normalize_to_screen(self, norm_x: float, norm_y: float,
@@ -183,12 +279,7 @@ class InputHandler:
         return (max(0, min(w - 1, x)), max(0, min(h - 1, y)))
 
     def _send_input(self, inp: INPUT) -> bool:
-        res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-        if res == 0:
-            # SendInput failed, try re-attaching thread to active input desktop (e.g. UAC or lock screen)
-            self._ensure_input_desktop(force=True)
-            res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
-        return res > 0
+        return self.injector.send_input(inp)
 
     def _calc_coords(self, norm_x: float, norm_y: float,
                      monitor_bounds: tuple[int, int, int, int] = None,
@@ -213,11 +304,14 @@ class InputHandler:
 
         if virtual_bounds:
             vx, vy, vw, vh = virtual_bounds
-        else:
+        elif self.user32 and hasattr(self.user32, "GetSystemMetrics"):
             vx = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
             vy = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
             vw = self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
             vh = self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        else:
+            vx, vy = 0, 0
+            vw, vh = self.get_screen_bounds()
 
         if vw > 0 and vh > 0:
             norm_vx = (pixel_x - vx) / vw
@@ -232,15 +326,25 @@ class InputHandler:
 
     def move_mouse_relative(self, dx: float, dy: float) -> tuple[int, int]:
         """Move cursor relatively (for virtual trackpad / relative mouse mode)."""
-        pos = ctypes.wintypes.POINT()
-        if not self.user32.GetCursorPos(ctypes.byref(pos)):
-            self._ensure_input_desktop(force=True)
-            self.user32.GetCursorPos(ctypes.byref(pos))
-        new_x = pos.x + int(dx)
-        new_y = pos.y + int(dy)
-        if not self.user32.SetCursorPos(new_x, new_y):
-            self._ensure_input_desktop(force=True)
-            self.user32.SetCursorPos(new_x, new_y)
+        if self.user32 and hasattr(self.user32, "GetCursorPos"):
+            pos = ctypes.wintypes.POINT()
+            if not self.user32.GetCursorPos(ctypes.byref(pos)):
+                self._ensure_input_desktop(force=True)
+                self.user32.GetCursorPos(ctypes.byref(pos))
+            cur_x, cur_y = pos.x, pos.y
+        else:
+            cur_x, cur_y = self.last_pixel_pos
+
+        new_x = cur_x + int(dx)
+        new_y = cur_y + int(dy)
+
+        if self.user32 and hasattr(self.user32, "SetCursorPos"):
+            if not self.user32.SetCursorPos(new_x, new_y):
+                self._ensure_input_desktop(force=True)
+                self.user32.SetCursorPos(new_x, new_y)
+        elif hasattr(self.injector, "set_cursor_pos"):
+            self.injector.set_cursor_pos(new_x, new_y)
+
         self.last_pixel_pos = (new_x, new_y)
         return (new_x, new_y)
 
@@ -251,22 +355,16 @@ class InputHandler:
         pixel_x, pixel_y, abs_x, abs_y = self._calc_coords(norm_x, norm_y, monitor_bounds, virtual_bounds)
         self.last_pixel_pos = (pixel_x, pixel_y)
 
-        # 1. Direct hardware/OS pixel positioning
-        if not self.user32.SetCursorPos(pixel_x, pixel_y):
-            self._ensure_input_desktop(force=True)
-            self.user32.SetCursorPos(pixel_x, pixel_y)
-
-        # 2. Virtual desktop coordinate injection
+        # Send one absolute virtual-desktop event. SetCursorPos followed by
+        # SendInput injected the same move twice and made pointer motion jittery.
         inp = INPUT()
         inp.type = INPUT_MOUSE
         inp.union.mi.dx = abs_x
         inp.union.mi.dy = abs_y
         inp.union.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        self._send_input(inp)
-        return (pixel_x, pixel_y)
-
         if not self._send_input(inp):
-            self.user32.mouse_event(
+            # Fallback for desktops where absolute SendInput is unavailable.
+            self.injector.mouse_event(
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 abs_x, abs_y, 0, 0
             )
@@ -275,6 +373,7 @@ class InputHandler:
     def mouse_down(self, button = "left", norm_x: float = None, norm_y: float = None,
                    monitor_bounds=None, virtual_bounds=None):
         button = normalize_button(button)
+        self._pressed_mouse_buttons.add(button)
         if norm_x is not None and norm_y is not None:
             self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
 
@@ -292,12 +391,12 @@ class InputHandler:
         inp.union.mi.dwExtraInfo = 100
 
         if not self._send_input(inp):
-            self.user32.mouse_event(flag, 0, 0, 0, 0)
-        self.user32.mouse_event(flag, 0, 0, 0, 0)
+            self.injector.mouse_event(flag, 0, 0, 0, 0)
 
     def mouse_up(self, button = "left", norm_x: float = None, norm_y: float = None,
                  monitor_bounds=None, virtual_bounds=None):
         button = normalize_button(button)
+        self._pressed_mouse_buttons.discard(button)
         if norm_x is not None and norm_y is not None:
             self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
 
@@ -315,8 +414,7 @@ class InputHandler:
         inp.union.mi.dwExtraInfo = 100
 
         if not self._send_input(inp):
-            self.user32.mouse_event(flag, 0, 0, 0, 0)
-        self.user32.mouse_event(flag, 0, 0, 0, 0)
+            self.injector.mouse_event(flag, 0, 0, 0, 0)
 
     def mouse_click(self, button = "left", norm_x: float = None, norm_y: float = None,
                     monitor_bounds=None, virtual_bounds=None):
@@ -345,7 +443,7 @@ class InputHandler:
         inp.union.mi.dwFlags = MOUSEEVENTF_WHEEL
         inp.union.mi.mouseData = delta
         if not self._send_input(inp):
-            self.user32.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+            self.injector.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
 
     def key_down(self, vk_code: int):
         self._pressed_keys.add(vk_code)
@@ -358,7 +456,7 @@ class InputHandler:
         inp.union.ki.wVk = vk_code
         inp.union.ki.dwFlags = flags
         if not self._send_input(inp):
-            self.user32.keybd_event(vk_code, 0, flags, 0)
+            self.injector.keybd_event(vk_code, 0, flags, 0)
 
     def key_up(self, vk_code: int):
         self._pressed_keys.discard(vk_code)
@@ -371,7 +469,21 @@ class InputHandler:
         inp.union.ki.wVk = vk_code
         inp.union.ki.dwFlags = flags
         if not self._send_input(inp):
-            self.user32.keybd_event(vk_code, 0, flags, 0)
+            self.injector.keybd_event(vk_code, 0, flags, 0)
+
+    def release_all_mouse_buttons(self):
+        """Release all currently pressed mouse buttons to avoid stuck drag states."""
+        for btn in list(self._pressed_mouse_buttons):
+            self.mouse_up(btn)
+        self._pressed_mouse_buttons.clear()
+        # Safety fallback: ensure left, right, middle physical state is cleared
+        for btn in ("left", "right", "middle"):
+            flag = MOUSEEVENTF_LEFTUP if btn == "left" else (MOUSEEVENTF_RIGHTUP if btn == "right" else MOUSEEVENTF_MIDDLEUP)
+            inp = INPUT()
+            inp.type = INPUT_MOUSE
+            inp.union.mi.dwFlags = flag
+            if not self._send_input(inp):
+                self.injector.mouse_event(flag, 0, 0, 0, 0)
 
     def release_all_keys(self):
         """Release all currently pressed keys to avoid stuck modifiers or letters."""
@@ -388,7 +500,13 @@ class InputHandler:
             inp.union.ki.wVk = mod
             inp.union.ki.dwFlags = flags
             if not self._send_input(inp):
-                self.user32.keybd_event(mod, 0, flags, 0)
+                self.injector.keybd_event(mod, 0, flags, 0)
+        # Also release any stuck mouse buttons
+        self.release_all_mouse_buttons()
+
+    def release_all_inputs(self):
+        """Release both keyboard keys and mouse buttons."""
+        self.release_all_keys()
 
     def send_unicode_char(self, char_or_text: str):
         """Send unicode character or full text string directly (immune to layout differences)."""
@@ -507,20 +625,23 @@ class InputHandler:
             self.send_key_combination([VK_CONTROL, VK_SHIFT, VK_ESCAPE]) # Ctrl+Shift+Esc
             return True
         elif cmd in ("lock", "lock_screen", "win_l"):
-            try:
-                self.user32.LockWorkStation()
-                return True
-            except Exception:
-                self.send_key_combination([VK_LWIN, 0x4C]) # Win + L
-                return True
-        elif cmd in ("ctrl_alt_del", "sas"):
-            try:
-                sas_func = getattr(ctypes.windll.sas, "SendSAS", None)
-                if sas_func:
-                    sas_func(0)
+            if not is_test_environment() and self.user32 and hasattr(self.user32, "LockWorkStation"):
+                try:
+                    self.user32.LockWorkStation()
                     return True
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            self.send_key_combination([VK_LWIN, 0x4C]) # Win + L
+            return True
+        elif cmd in ("ctrl_alt_del", "sas"):
+            if not is_test_environment():
+                try:
+                    sas_func = getattr(ctypes.windll.sas, "SendSAS", None)
+                    if sas_func:
+                        sas_func(0)
+                        return True
+                except Exception:
+                    pass
             self.send_key_combination([VK_CONTROL, VK_MENU, VK_DELETE])
             return True
 

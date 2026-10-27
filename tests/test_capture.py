@@ -1,13 +1,13 @@
 import pytest
-from src.capture import DesktopCapture
+from src.capture import MockDesktopCapture
 
 def test_desktop_capture_initialization():
-    cap = DesktopCapture(quality=75)
+    cap = MockDesktopCapture(quality=75)
     assert cap.quality == 75
     cap.close()
 
 def test_desktop_capture_frame():
-    cap = DesktopCapture(quality=70)
+    cap = MockDesktopCapture(quality=70)
     jpeg_data, screen_size, cursor_pos = cap.capture_frame()
     assert isinstance(jpeg_data, bytes)
     assert len(jpeg_data) > 100
@@ -16,13 +16,13 @@ def test_desktop_capture_frame():
     cap.close()
 
 def test_desktop_switch_desktop():
-    cap = DesktopCapture()
+    cap = MockDesktopCapture()
     res = cap.switch_desktop()
     assert isinstance(res, bool)
     cap.close()
 
 def test_desktop_multimonitor():
-    cap = DesktopCapture()
+    cap = MockDesktopCapture()
     monitors = cap.get_monitors_list()
     assert isinstance(monitors, list)
     assert len(monitors) >= 1
@@ -37,20 +37,20 @@ def test_desktop_multimonitor():
     cap.close()
 
 def test_desktop_capture_pure_pillow_fallback(monkeypatch):
-    """Verify DesktopCapture functions perfectly when cv2 and numpy are absent (standalone mode)."""
+    """Verify DesktopCapture functions safely in simulated standalone mode."""
     import src.capture as cap_mod
     monkeypatch.setattr(cap_mod, "HAS_CV2", False)
     monkeypatch.setattr(cap_mod, "cv2", None)
     monkeypatch.setattr(cap_mod, "np", None)
 
-    cap = cap_mod.DesktopCapture(quality=65)
+    cap = cap_mod.MockDesktopCapture(quality=65)
     jpeg_data, screen_size, cursor_pos = cap.capture_frame()
     assert isinstance(jpeg_data, bytes)
     assert len(jpeg_data) > 100
     assert screen_size[0] > 0 and screen_size[1] > 0
     assert isinstance(cursor_pos, tuple)
 
-    # Test change detection in pure Pillow mode
+    # Test change detection in simulated mode
     frame_same, _, _ = cap.capture_frame(only_if_changed=True)
     assert frame_same is None or isinstance(frame_same, bytes)
 
@@ -74,16 +74,15 @@ def test_src_modules_import_without_cv2(monkeypatch):
     assert hasattr(src.client_viewer, "ClientViewerGUI")
 
 def test_dxcam_fallback_resilience():
-    cap = DesktopCapture()
-    # If dxcam is not available or access denied, GDI fallback must seamlessly work
+    cap = MockDesktopCapture()
+    # Simulated capture does not attach DirectX hooks or GDI DC
     data, dims, cur = cap.capture_frame(only_if_changed=False)
     assert isinstance(data, bytes)
     assert len(data) > 0
     cap.close()
 
 def test_high_resolution_change_detection(monkeypatch):
-    import numpy as np
-    cap = DesktopCapture(target_width=320, target_height=180)
+    cap = MockDesktopCapture(target_width=320, target_height=180)
     # Simulate first frame
     frame1, dims, cur = cap.capture_frame(only_if_changed=False)
     assert frame1 is not None

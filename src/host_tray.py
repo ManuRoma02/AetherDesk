@@ -1,3 +1,12 @@
+"""
+AetherDesk Host Control Panel (Tray UI).
+
+Architectural Boundary:
+- GUI Layer: Tkinter desktop panel running on the main UI thread.
+- Host Session Layer: Dedicated daemon thread running HostDaemon with its own event loop and embedded broker.
+- Threadsafe Control: UI triggers start/stop via threadsafe HostDaemon lifecycle methods with explicit timeouts.
+"""
+
 import os
 import sys
 import socket
@@ -24,6 +33,9 @@ from src.signaling_broker import SignalingBroker
 from src.ota import (
     get_app_version,
     cleanup_old_versions,
+    confirm_boot,
+    check_boot_state,
+    OTAUpdateState,
     check_github_update,
     download_github_binary,
     apply_in_place_update
@@ -100,6 +112,7 @@ class HostControlPanel:
         self._center_window(self.root, 520, 680)
         self.root.configure(bg=THEME["bg"])
         self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Set official window icon
         icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "assets", "icon.png"))
@@ -110,10 +123,9 @@ class HostControlPanel:
             except Exception:
                 pass
 
-        try:
-            cleanup_old_versions()
-        except Exception:
-            pass
+        # Failsafe Boot Confirmation: check if running in TESTING state
+        if check_boot_state() == OTAUpdateState.TESTING:
+            self.root.after(2500, self._verify_and_confirm_ota_boot)
 
         self.security = SecurityManager()
         self.daemon = None
@@ -393,6 +405,21 @@ class HostControlPanel:
                     pass
             self.root.after(1500, _revert_pwd)
 
+    def _on_close(self):
+        try:
+            if self.daemon:
+                self.daemon.stop(timeout=2.0)
+            if self.daemon_thread and self.daemon_thread.is_alive():
+                self.daemon_thread.join(timeout=2.0)
+                if not self.daemon_thread.is_alive():
+                    self.daemon_thread = None
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _toggle_daemon(self):
         if not self.daemon or not self.daemon.running:
             broker_url = self.entry_broker.get().strip() or "ws://127.0.0.1:8765"
@@ -402,26 +429,22 @@ class HostControlPanel:
             self.btn_daemon.config(text="Arresta Servizio", bg=THEME["danger"])
             self.lbl_status.config(text="● Servizio Host Attivo (Pronto all'ascolto)", fg=THEME["success"])
         else:
-            self.daemon.stop()
-            if self.local_broker:
-                try:
-                    asyncio.run(self.local_broker.stop())
-                except Exception:
-                    pass
-                self.local_broker = None
+            if self.daemon:
+                self.daemon.stop(timeout=2.0)
+                self.daemon = None
+            if self.daemon_thread and self.daemon_thread.is_alive():
+                self.daemon_thread.join(timeout=2.0)
+                if not self.daemon_thread.is_alive():
+                    self.daemon_thread = None
+            self.local_broker = None
             self.btn_daemon.config(text="Avvia Servizio", bg=THEME["accent"])
             self.lbl_status.config(text="● Servizio Host Arrestato", fg=THEME["danger"])
 
     def _run_daemon(self):
-        async def runner():
-            if self.var_local_broker.get():
-                try:
-                    self.local_broker = SignalingBroker(host="0.0.0.0", port=8765)
-                    await self.local_broker.start()
-                except Exception:
-                    pass
-            await self.daemon.start()
-        asyncio.run(runner())
+        try:
+            asyncio.run(self.daemon.start())
+        except Exception as e:
+            pass
 
     def _open_installer(self):
         base_dir = getattr(sys, "_MEIPASS", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -460,7 +483,12 @@ class HostControlPanel:
                 f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
             )
             if confirm:
-                self._start_git_download(info["download_url"], tag)
+                self._start_git_download(
+                    info["download_url"],
+                    tag,
+                    expected_sha256=info.get("expected_sha256"),
+                    signed_manifest=info.get("manifest")
+                )
         else:
             threading.Thread(
                 target=lambda: self._check_git_updates_background(notify_if_none=True, prompt_on_found=True),
@@ -498,7 +526,12 @@ class HostControlPanel:
                             f"Vuoi scaricare l'aggiornamento e riavviare adesso automaticamente?"
                         )
                         if confirm:
-                            self._start_git_download(info["download_url"], tag)
+                            self._start_git_download(
+                                info["download_url"],
+                                tag,
+                                expected_sha256=info.get("expected_sha256"),
+                                signed_manifest=info.get("manifest")
+                            )
                 else:
                     err = info.get("error")
                     if err:
@@ -526,7 +559,13 @@ class HostControlPanel:
             if self.btn_header_update:
                 self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, fg="#f87171"))
 
-    def _start_git_download(self, download_url: str, target_version: str):
+    def _start_git_download(
+        self,
+        download_url: str,
+        target_version: str,
+        expected_sha256: Optional[str] = None,
+        signed_manifest: Optional[dict] = None
+    ):
         self.ota_downloading = True
         if self.btn_header_update:
             self.btn_header_update.config(text="⬇ Scaricamento...", state=tk.DISABLED)
@@ -537,17 +576,32 @@ class HostControlPanel:
                 txt = f"⬇ {pct}%"
                 self.root.after(0, lambda: self.btn_header_update.config(text=txt) if self.btn_header_update else None)
 
-            success, temp_path_or_err = download_github_binary(download_url, progress_callback=on_progress)
+            success, temp_path_or_err = download_github_binary(
+                download_url,
+                progress_callback=on_progress,
+                expected_sha256=expected_sha256,
+                signed_manifest=signed_manifest
+            )
             if not success:
                 self.ota_downloading = False
                 self.root.after(0, lambda: messagebox.showerror("Errore Download", f"Impossibile scaricare l'aggiornamento:\n{temp_path_or_err}"))
                 self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL, bg="#161b2b", fg="#f87171") if self.btn_header_update else None)
                 return
 
-            applied, app_msg = apply_in_place_update(temp_path_or_err, target_version=target_version)
+            applied, app_msg = apply_in_place_update(
+                temp_path_or_err,
+                target_version=target_version,
+                expected_sha256=expected_sha256,
+                signed_manifest=signed_manifest
+            )
             self.ota_downloading = False
             if applied:
-                self.root.after(0, lambda: messagebox.showinfo("Aggiornamento Riuscito", app_msg))
+                logger.info(f"HostTray: Aggiornamento applicato ({app_msg}). Arresto ordinato per riavvio.")
+                try:
+                    if self.daemon:
+                        self.daemon.stop()
+                except Exception:
+                    pass
                 try:
                     self.root.destroy()
                 except Exception:
@@ -555,10 +609,25 @@ class HostControlPanel:
                 import os
                 os._exit(0)
             else:
+                try:
+                    p_temp = Path(temp_path_or_err)
+                    if p_temp.is_file():
+                        p_temp.unlink()
+                except Exception:
+                    pass
                 self.root.after(0, lambda: messagebox.showerror("Errore Installazione", f"Impossibile applicare l'aggiornamento:\n{app_msg}"))
                 self.root.after(0, lambda: self.btn_header_update.config(text="🔄 Riprova", state=tk.NORMAL) if self.btn_header_update else None)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _verify_and_confirm_ota_boot(self):
+        try:
+            if self.root and (self.daemon is None or self.daemon.running):
+                confirmed = confirm_boot()
+                if confirmed:
+                    logger.info("HostTray: Aggiornamento OTA confermato con successo al boot.")
+        except Exception as e:
+            logger.error(f"HostTray: Errore durante la conferma del boot: {e}")
 
     def run(self):
         self.root.mainloop()
