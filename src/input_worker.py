@@ -171,6 +171,17 @@ def validate_input_command(cmd: Any) -> Tuple[bool, Optional[str], Optional[dict
             else:
                 return False, f"Unsupported item in key combination: {k}", None
 
+    # Preserve correlation sequence and transport identifier
+    clean_seq = None
+    seq_val = cmd.get("seq")
+    if seq_val is not None:
+        try:
+            clean_seq = int(seq_val)
+        except (ValueError, TypeError):
+            clean_seq = None
+
+    clean_transport = str(cmd.get("transport", ""))[:32] if cmd.get("transport") else None
+
     sanitized = {
         "action": action,
         "norm_x": clean_nx,
@@ -184,6 +195,8 @@ def validate_input_command(cmd: Any) -> Tuple[bool, Optional[str], Optional[dict
         "text": text_val,
         "keys": clean_keys,
         "command": cmd.get("command") or cmd.get("shortcut"),
+        "seq": clean_seq,
+        "transport": clean_transport,
     }
     return True, None, sanitized
 
@@ -224,6 +237,10 @@ class CoalescingQueue:
                         # Sum relative deltas
                         last_cmd["dx"] = (last_cmd.get("dx") or 0.0) + (cmd.get("dx") or 0.0)
                         last_cmd["dy"] = (last_cmd.get("dy") or 0.0) + (cmd.get("dy") or 0.0)
+                        if cmd.get("seq") is not None:
+                            last_cmd["seq"] = cmd.get("seq")
+                        if cmd.get("transport") is not None:
+                            last_cmd["transport"] = cmd.get("transport")
                         return True
                     elif not last_is_rel and not curr_is_rel:
                         # Absolute coordinates: overwrite with latest target
@@ -231,8 +248,10 @@ class CoalescingQueue:
                         last_cmd["norm_y"] = cmd.get("norm_y")
                         last_cmd["dx"] = cmd.get("dx")
                         last_cmd["dy"] = cmd.get("dy")
-                        if "seq" in cmd:
-                            last_cmd["seq"] = cmd["seq"]
+                        if cmd.get("seq") is not None:
+                            last_cmd["seq"] = cmd.get("seq")
+                        if cmd.get("transport") is not None:
+                            last_cmd["transport"] = cmd.get("transport")
                         return True
 
             # Reserve headroom specifically for key_up/mouse_up events
@@ -322,7 +341,7 @@ class InputWorker:
         self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> bool:
-        """Stop worker loop, wait for in-flight event, and safely release stuck inputs."""
+        """Stop worker loop, wait for in-flight event, safely release stuck inputs, and close handler."""
         self._running = False
         self.queue.clear()
         with self.queue._lock:
@@ -330,20 +349,36 @@ class InputWorker:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
-                logger.warning("InputWorker thread did not terminate within timeout")
+                logger.warning("InputWorker thread did not terminate within timeout; skipping input_handler close to avoid race condition")
+                return False
         ok = self.release_all(timeout=timeout)
         if not ok:
             logger.error("InputWorker.stop: could not acquire lock to release inputs within timeout.")
+        if hasattr(self.input_handler, "close"):
+            try:
+                self.input_handler.close()
+            except Exception as e:
+                logger.debug(f"InputWorker.stop: input_handler close error: {e}")
         return ok
 
     def enqueue(self, cmd: dict) -> bool:
         """Enqueue validated input command for asynchronous injection. Returns False if rejected."""
         ok = self.queue.put(cmd)
+        action = cmd.get("action", "")
+        seq = cmd.get("seq")
+        transport = cmd.get("transport")
         if not ok:
-            action = cmd.get("action", "")
             if action in RELEASE_ACTIONS:
                 self._handle_rejected_release(cmd)
+            logger.warning(f"[INPUT_ENQUEUE] REJECTED (queue full): seq={seq} transport={transport} action={action}")
             return False
+        if action not in ("mouse_move", "move", "touch_move", "cursor_move"):
+            logger.info(f"[INPUT_ENQUEUE] seq={seq} transport={transport} action={action} queue_depth={len(self.queue._items)}")
+        else:
+            cnt = getattr(self, "_enqueued_move_count", 0) + 1
+            self._enqueued_move_count = cnt
+            if cnt % 100 == 0:
+                logger.debug(f"[INPUT_ENQUEUE] transport={transport} move_count={cnt} queue_depth={len(self.queue._items)} last_seq={seq}")
         return True
 
     def _handle_rejected_release(self, cmd: dict):
@@ -443,19 +478,63 @@ class InputWorker:
                                 self.input_handler.release_all_keys()
                 continue
 
+            action = cmd.get("action", "")
+            seq = cmd.get("seq")
+            transport = cmd.get("transport")
+            is_move = action in ("mouse_move", "move", "touch_move", "cursor_move")
+            status = "worker_error"
             try:
                 with self._exec_lock:
-                    self._execute_command(cmd)
+                    if not is_move:
+                        logger.info(f"[INPUT_DISPATCH] seq={seq} transport={transport} action={action}")
+                    else:
+                        cnt = getattr(self, "_dispatched_move_count", 0) + 1
+                        self._dispatched_move_count = cnt
+                        if cnt % 100 == 0:
+                            logger.debug(f"[INPUT_DISPATCH] transport={transport} move_count={cnt} last_seq={seq}")
+
+                    try:
+                        self._execute_command(cmd)
+                        status = "handler_completed"
+                    except Exception as exc:
+                        status = "handler_error"
+                        logger.error(
+                            f"[INPUT_ERROR] seq={seq} transport={transport} action={action} "
+                            f"exception_type={type(exc).__name__}"
+                        )
+
                     if self._release_pending:
-                        self._release_pending = False
-                        if hasattr(self.input_handler, "release_all_inputs"):
-                            self.input_handler.release_all_inputs()
-                        elif hasattr(self.input_handler, "release_all_keys"):
-                            self.input_handler.release_all_keys()
-            except Exception as e:
-                logger.error(f"Error in InputWorker executing {cmd.get('action')}: {e}", exc_info=True)
+                        try:
+                            if hasattr(self.input_handler, "release_all_inputs"):
+                                self.input_handler.release_all_inputs()
+                            elif hasattr(self.input_handler, "release_all_keys"):
+                                self.input_handler.release_all_keys()
+                            self._release_pending = False
+                        except Exception as exc:
+                            logger.error(
+                                f"[INPUT_RELEASE] seq={seq} transport={transport} action={action} "
+                                f"exception_type={type(exc).__name__}"
+                            )
+            except Exception as exc:
+                status = "worker_error"
+                logger.error(
+                    f"[INPUT_WORKER_ERROR] seq={seq} transport={transport} action={action} "
+                    f"exception_type={type(exc).__name__}"
+                )
             finally:
-                self.queue.finish_execution()
+                try:
+                    if not is_move:
+                        logger.info(f"[INPUT_COMPLETE] seq={seq} transport={transport} action={action} status={status}")
+                    else:
+                        cnt_comp = getattr(self, "_completed_move_count", 0) + 1
+                        self._completed_move_count = cnt_comp
+                        if cnt_comp % 100 == 0:
+                            logger.debug(
+                                f"[INPUT_COMPLETE] transport={transport} move_count={cnt_comp} "
+                                f"last_seq={seq} status={status}"
+                            )
+                finally:
+                    self.queue.finish_execution()
 
     def _execute_command(self, cmd: dict):
         """Execute a single sanitized input command on the input handler."""
@@ -465,6 +544,7 @@ class InputWorker:
         dx = cmd.get("dx")
         dy = cmd.get("dy")
         btn = cmd.get("button", "left")
+        seq = cmd.get("seq")
 
         mon_bounds = None
         virt_bounds = None
@@ -477,67 +557,67 @@ class InputWorker:
         # 1. Mouse Move / Drag / Trackpad
         if action in ("mouse_move", "move", "touch_move", "cursor_move"):
             if dx is not None and dy is not None and (nx is None or ny is None):
-                self.input_handler.move_mouse_relative(float(dx), float(dy))
+                self.input_handler.move_mouse_relative(float(dx), float(dy), seq=seq)
             elif nx is not None and ny is not None:
-                self.input_handler.move_mouse(float(nx), float(ny), monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+                self.input_handler.move_mouse(float(nx), float(ny), monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 2. Mouse Down
         elif action in ("mouse_down", "touch_down", "down", "pointer_down"):
-            self.input_handler.mouse_down(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_down(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 3. Mouse Up
         elif action in ("mouse_up", "touch_up", "up", "pointer_up"):
-            self.input_handler.mouse_up(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_up(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 4. Click / Tap
         elif action in ("mouse_click", "click", "tap", "touch_tap", "pointer_click"):
-            self.input_handler.mouse_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 5. Right Click
         elif action in ("right_click", "context_menu", "secondary_click"):
-            self.input_handler.mouse_click("right", norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_click("right", norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 6. Double Click
         elif action in ("mouse_double_click", "double_click", "double_tap"):
-            self.input_handler.mouse_double_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_double_click(btn, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 7. Mouse Wheel / Scroll
         elif action in ("mouse_wheel", "wheel", "scroll"):
             delta = cmd.get("delta") or 0
-            self.input_handler.mouse_wheel(delta, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds)
+            self.input_handler.mouse_wheel(delta, norm_x=nx, norm_y=ny, monitor_bounds=mon_bounds, virtual_bounds=virt_bounds, seq=seq)
 
         # 8. Keyboard Key Down
         elif action in ("key_down", "keydown"):
             vk = cmd.get("vk", 0)
             char = cmd.get("text")
             if (not vk or vk == 0) and char:
-                self.input_handler.send_unicode_char(char)
+                self.input_handler.send_unicode_char(char, seq=seq)
             elif vk:
-                self.input_handler.key_down(int(vk))
+                self.input_handler.key_down(int(vk), seq=seq)
             elif cmd.get("key"):
                 k = str(cmd.get("key")).lower()
                 from src.input_handler import VK_MAP
                 if k in VK_MAP:
-                    self.input_handler.key_down(VK_MAP[k])
+                    self.input_handler.key_down(VK_MAP[k], seq=seq)
                 else:
-                    self.input_handler.send_unicode_char(cmd.get("key"))
+                    self.input_handler.send_unicode_char(cmd.get("key"), seq=seq)
 
         # 9. Keyboard Key Up
         elif action in ("key_up", "keyup"):
             vk = cmd.get("vk", 0)
             if vk:
-                self.input_handler.key_up(int(vk))
+                self.input_handler.key_up(int(vk), seq=seq)
             elif cmd.get("key"):
                 k = str(cmd.get("key")).lower()
                 from src.input_handler import VK_MAP
                 if k in VK_MAP:
-                    self.input_handler.key_up(VK_MAP[k])
+                    self.input_handler.key_up(VK_MAP[k], seq=seq)
 
         # 10. Unicode Text / Typing
         elif action in ("unicode_char", "char", "text", "type_text", "string", "input_text"):
             text_val = cmd.get("text", "")
             if text_val:
-                self.input_handler.send_unicode_char(text_val)
+                self.input_handler.send_unicode_char(text_val, seq=seq)
 
         # 11. Special Shortcuts / Combos / Hotkeys
         elif action in ("special", "command", "shortcut", "hotkey", "key_combination", "combo"):
@@ -545,11 +625,11 @@ class InputWorker:
             keys_list = cmd.get("keys")
             if keys_list:
                 if isinstance(keys_list[0], int):
-                    self.input_handler.send_key_combination(keys_list)
+                    self.input_handler.send_key_combination(keys_list, seq=seq)
                 else:
-                    self.input_handler.send_key_combination_by_names(keys_list)
+                    self.input_handler.send_key_combination_by_names(keys_list, seq=seq)
             elif cmd_str:
-                self.input_handler.send_special(cmd_str)
+                self.input_handler.send_special(cmd_str, seq=seq)
 
         # 12. Direct Clipboard Set / Paste via Input Command
         elif action in ("clipboard", "set_clipboard", "copy_text", "paste_text"):

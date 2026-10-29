@@ -9,7 +9,7 @@ cd /d "%~dp0\.."
 
 echo [1/3] Verifica toolchain Rust (cargo)...
 where cargo >nul 2>&1
-if %errorLevel% neq 0 (
+if errorlevel 1 (
     echo.
     echo [ERRORE BLOCCANTE] Toolchain Rust (cargo) non trovato nel PATH.
     echo La modalita' nativa ad alte prestazioni H.264/WebRTC richiede il compilatore Rust.
@@ -19,7 +19,7 @@ if %errorLevel% neq 0 (
 
 echo Compilazione crate nativo Rust (native\aether_core)...
 cargo build --release --manifest-path "native\aether_core\Cargo.toml"
-if %errorLevel% neq 0 (
+if errorlevel 1 (
     echo.
     echo [ERRORE BLOCCANTE] Compilazione Cargo di native\aether_core fallita.
     exit /b 1
@@ -42,7 +42,7 @@ echo.
 echo [3/3] Packaging PyInstaller con RemoteClient.spec...
 pyinstaller --clean --workpath "%TEMP%\aether_build" --distpath "%TEMP%\aether_dist" "RemoteClient.spec"
 
-if %errorLevel% equ 0 (
+if not errorlevel 1 (
     copy /y "%TEMP%\aether_dist\AetherDesk.exe" "dist\AetherDesk.exe" >nul 2>&1
     copy /y "%TEMP%\aether_dist\AetherDesk.exe" "dist\RemoteClient.exe" >nul 2>&1
     copy /y "%TEMP%\aether_dist\AetherDesk.exe" "%USERPROFILE%\Downloads\AetherDesk.exe" >nul 2>&1

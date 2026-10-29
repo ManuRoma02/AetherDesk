@@ -18,7 +18,7 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.5.0"
+CURRENT_VERSION = "1.5.1"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 # Embedded Vendor Public Key for OTA Manifest Verification (Ed25519, 32 bytes raw / 64 hex characters).

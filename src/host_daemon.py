@@ -103,6 +103,8 @@ class HostDaemon:
         self.native_engine: NativeRealtimeEngine = get_native_engine()
         self.production_mode: str = "webrtc_native" if self.native_engine.is_native_loaded else "standard_fallback"
         self._webrtc_active: bool = False
+        # Keep the reliable input transport active if only the native video pipeline fails.
+        self._webrtc_video_active: bool = False
         self._listener_task: Optional[asyncio.Task] = None
         self._stream_task: Optional[asyncio.Task] = None
         self._child_tasks: set[asyncio.Task] = set()
@@ -111,7 +113,7 @@ class HostDaemon:
         self._in_flight_frame = False
         self._in_flight_fids: set[int] = set()
         self._frame_send_times: dict[int, float] = {}
-        self._max_in_flight = 2
+        self._max_in_flight = 3
         self.telemetry: dict[str, Any] = {}
         self._streaming_active = False
         self._stream_generation: int = 0
@@ -246,7 +248,7 @@ class HostDaemon:
             "sleep_prevention": self._sleep_prevented,
         }
 
-    def handle_client_message(self, msg_type: str, payload: dict, binary: Optional[bytes], session_state: dict) -> Optional[bytes]:
+    def handle_client_message(self, msg_type: str, payload: dict, binary: Optional[bytes], session_state: dict, transport: str = "websocket") -> Optional[bytes]:
         """Process incoming client message, authenticate or execute input."""
         if msg_type == "CLIENT_DISCONNECTED":
             token = payload.get("broker_token", "") if isinstance(payload, dict) else ""
@@ -257,6 +259,7 @@ class HostDaemon:
                 return None
             self._streaming_active = False
             self._webrtc_active = False
+            self._webrtc_video_active = False
             if hasattr(self, "native_engine") and self.native_engine:
                 self.native_engine.destroy_host_session()
             self.prevent_sleep(False)
@@ -443,15 +446,28 @@ class HostDaemon:
                     logger.warning(f"Failed to decrypt input binary packet: {e}")
                     return None
 
+            if isinstance(cmd_raw, dict) and not cmd_raw.get("transport"):
+                cmd_raw["transport"] = transport
             is_valid, err_msg, clean_cmd = validate_input_command(cmd_raw)
             if not is_valid:
                 logger.warning(f"Rejected invalid input command: {err_msg}")
                 return None
 
+            action = clean_cmd.get("action", "")
+            seq = clean_cmd.get("seq")
+            clean_trans = clean_cmd.get("transport") or transport
+            if action not in ("mouse_move", "move", "touch_move", "cursor_move"):
+                logger.info(f"[INPUT_RECV] seq={seq} transport={clean_trans} action={action} authenticated=True")
+            else:
+                cnt = getattr(self, "_recv_move_count", 0) + 1
+                self._recv_move_count = cnt
+                if cnt % 100 == 0:
+                    logger.debug(f"[INPUT_RECV] transport={clean_trans} move_count={cnt} last_seq={seq}")
+
             enqueued = self.input_worker.enqueue(clean_cmd)
             if not enqueued:
-                logger.error(f"Input queue saturated or event rejected: {clean_cmd.get('action')}")
-                return ProtocolMessage.serialize("ERROR", {"error": "input_queue_saturated", "action": clean_cmd.get("action")})
+                logger.error(f"[INPUT_ENQUEUE] FAILED: Input queue saturated or event rejected: seq={seq} action={action}")
+                return ProtocolMessage.serialize("ERROR", {"error": "input_queue_saturated", "action": action, "seq": seq})
 
             return ProtocolMessage.serialize("ACK", {"status": "ok"})
 
@@ -569,14 +585,22 @@ class HostDaemon:
 
         cx, cy, cseq = cursor_upd
         ref_w, ref_h = self.input_handler.get_screen_bounds() if hasattr(self, "input_handler") and self.input_handler else (1920, 1080)
-        norm_x = (cx / ref_w) if (cx > 1.0 and ref_w > 0) else float(cx)
-        norm_y = (cy / ref_h) if (cy > 1.0 and ref_h > 0) else float(cy)
+        norm_x = (cx / ref_w) if ref_w > 0 else 0.0
+        norm_y = (cy / ref_h) if ref_h > 0 else 0.0
+        norm_x = max(0.0, min(1.0, float(norm_x)))
+        norm_y = max(0.0, min(1.0, float(norm_y)))
+
+        cnt = getattr(self, "_recv_webrtc_cursor_count", 0) + 1
+        self._recv_webrtc_cursor_count = cnt
+        if cnt % 100 == 0:
+            logger.debug(f"[INPUT_RECV] transport=webrtc_cursor move_count={cnt} last_seq={cseq}")
 
         cursor_cmd = {
             "action": "mouse_move",
             "norm_x": norm_x,
             "norm_y": norm_y,
             "seq": cseq,
+            "transport": "webrtc_cursor",
         }
         if hasattr(self, "input_worker") and self.input_worker:
             self.input_worker.enqueue(cursor_cmd)
@@ -584,6 +608,25 @@ class HostDaemon:
             self.input_handler.move_mouse(norm_x, norm_y)
 
         return (norm_x, norm_y, cseq)
+
+    def _drain_webrtc_input(self, session_key: bytes, session_state: Optional[dict]) -> None:
+        """Drain cursor and reliable control input independently of video transport state."""
+        self._poll_and_enqueue_webrtc_cursor()
+        for _ in range(64):
+            ctrl_data = self.native_engine.poll_host_control()
+            if not ctrl_data:
+                break
+            try:
+                if b"KEYFRAME_REQ" in ctrl_data:
+                    self._keyframe_requested = True
+                    logger.info("WebRTC client requested IDR keyframe (PLI/recovery).")
+                else:
+                    c_type, c_payload, c_bin = ProtocolMessage.deserialize(ctrl_data)
+                    target_state = session_state if session_state is not None else getattr(self, "_current_session_state", None)
+                    state = target_state if target_state is not None else {"authenticated": True, "session_key": session_key}
+                    self.handle_client_message(c_type, c_payload, c_bin, state, transport="webrtc_control")
+            except Exception as err:
+                logger.warning(f"Error handling WebRTC control packet: {err}")
 
     async def run_capture_stream(
         self,
@@ -665,6 +708,7 @@ class HostDaemon:
                     self._safe_release_inputs(timeout=2.0)
                     self._streaming_active = False
                     self._webrtc_active = False
+                    self._webrtc_video_active = False
                     if hasattr(self, "native_engine") and self.native_engine and self.native_engine.host_handle:
                         try:
                             self.native_engine.destroy_host_session()
@@ -696,50 +740,50 @@ class HostDaemon:
                     if ice_state in (2, 3):  # Connected or Completed
                         if not self._webrtc_active:
                             self._webrtc_active = True
+                            self._webrtc_video_active = True
+                            self._webrtc_step_errors = 0
                             logger.info("Host WebRTC P2P direct transport activated (ICE connected).")
                     elif ice_state in (4, 5, 6):  # Failed, Disconnected, or Closed
                         if self._webrtc_active:
                             self._webrtc_active = False
+                            self._webrtc_video_active = False
                             logger.warning(f"Host WebRTC ICE state {ice_state}, falling back to WebSocket stream.")
 
-                    # 3. Direct low-latency P2P loop when active
+                    # 3. Poll WebRTC input whenever ICE is connected. Video can fall back
+                    # independently without stranding the reliable control channel.
                     if self._webrtc_active:
-                        frame_counter += 1
-                        need_kf = getattr(self, "_keyframe_requested", False)
-                        self._keyframe_requested = False
-                        force_keyframe = (frame_counter == 1 or frame_counter % 90 == 0 or need_kf)
+                        if self._webrtc_video_active:
+                            frame_counter += 1
+                            need_kf = getattr(self, "_keyframe_requested", False)
+                            self._keyframe_requested = False
+                            force_keyframe = (frame_counter == 1 or frame_counter % 90 == 0 or need_kf)
 
-                        # Step native DXGI -> MF MFT -> WebRTC video track pipeline
-                        self.native_engine.step_host_pipeline(force_keyframe=force_keyframe)
+                            # Step native DXGI -> MF MFT -> WebRTC video track pipeline
+                            step_res = self.native_engine.step_host_pipeline(force_keyframe=force_keyframe)
+                            if step_res != 0:
+                                consec_err = getattr(self, "_webrtc_step_errors", 0) + 1
+                                self._webrtc_step_errors = consec_err
+                                if consec_err >= 10:
+                                    self._webrtc_video_active = False
+                                    logger.warning(
+                                        f"Native DXGI pipeline step failed repeatedly (code {step_res}). "
+                                        "Falling back to WebSocket video; WebRTC input remains active."
+                                    )
+                            else:
+                                self._webrtc_step_errors = 0
 
-                        # Poll latest-wins mouse movement from loss-tolerant cursor channel
-                        # Route through InputWorker to serialize with clicks/keys and prevent concurrent injection!
-                        self._poll_and_enqueue_webrtc_cursor()
+                        self._drain_webrtc_input(session_key, session_state)
 
-                        # Drain discrete control messages from reliable control channel (burst handling)
-                        for _ in range(64):
-                            ctrl_data = self.native_engine.poll_host_control()
-                            if not ctrl_data:
-                                break
-                            try:
-                                if b"KEYFRAME_REQ" in ctrl_data:
-                                    self._keyframe_requested = True
-                                    logger.info("WebRTC client requested IDR keyframe (PLI/recovery).")
-                                else:
-                                    c_type, c_payload, c_bin = ProtocolMessage.deserialize(ctrl_data)
-                                    target_state = session_state if session_state is not None else getattr(self, "_current_session_state", None)
-                                    s_state = target_state if target_state is not None else {"authenticated": True, "session_key": session_key}
-                                    self.handle_client_message(c_type, c_payload, c_bin, s_state)
-                            except Exception as err:
-                                logger.warning(f"Error handling WebRTC control packet: {err}")
+                        if self._webrtc_video_active:
+                            await asyncio.sleep(1.0 / 60.0)
+                            continue
 
-                        await asyncio.sleep(1.0 / 60.0)
-                        continue
-
-                # Adaptive Backpressure: small bounded in-flight pipeline (max 2 frames)
+                # Adaptive Backpressure: bounded in-flight pipeline (max 3 frames)
                 if len(self._in_flight_fids) >= self._max_in_flight:
                     try:
-                        await asyncio.wait_for(self._frame_ack_event.wait(), timeout=0.035)
+                        rtt_ms = self.telemetry.get("last_ack_rtt_ms", 30.0)
+                        ack_timeout = max(0.08, min(0.25, (rtt_ms / 1000.0) * 1.5))
+                        await asyncio.wait_for(self._frame_ack_event.wait(), timeout=ack_timeout)
                     except asyncio.TimeoutError:
                         # Stalled ACK: discard oldest un-ACKed frame ID to prevent blocking capture pipeline
                         if self._in_flight_fids:
@@ -770,12 +814,21 @@ class HostDaemon:
                     frame_counter += 1
                     force_keyframe = (frame_counter == 1 or frame_counter % 90 == 0)
 
-                    # Offload heavy screen capture and image compression to background thread (keeps event loop unblocked)
-                    cap_res = await asyncio.to_thread(self.capture.capture_frame, only_if_changed=(not force_keyframe))
+                    # 2 Hz minimum heartbeat on idle screens to keep client RTT & FPS telemetry active
+                    t_now_sec = time.time()
+                    time_since_last_send = t_now_sec - getattr(self, "_last_frame_sent_time", 0.0)
+                    force_heartbeat = (time_since_last_send >= 0.5)
+
+                    # Offload screen capture and image compression to background thread
+                    cap_res = await asyncio.to_thread(
+                        self.capture.capture_frame,
+                        only_if_changed=(not force_keyframe and not force_heartbeat)
+                    )
                     jpeg_bytes, size, cur = cap_res
                     t_cap_done = time.perf_counter_ns()
 
                     if jpeg_bytes:
+                        self._last_frame_sent_time = t_now_sec
                         t_enc_start = time.perf_counter_ns()
                         encrypted = await asyncio.to_thread(self.security.encrypt_packet, jpeg_bytes, session_key)
                         t_enc_done = time.perf_counter_ns()
@@ -803,7 +856,12 @@ class HostDaemon:
                             "t_send": t_now,
                             "cap_ms": cap_ms,
                             "enc_ms": enc_ms,
-                            "rtt_ms": self.telemetry.get("last_ack_rtt_ms", 0.0)
+                            "rtt_ms": self.telemetry.get("last_ack_rtt_ms", 0.0),
+                            "webrtc": False,
+                            "transport": "WebSocket JPEG",
+                            "backend": "GDI/Pillow",
+                            "in_flight": len(self._in_flight_fids),
+                            "dropped_acks": self.telemetry.get("late_or_dropped_acks", 0),
                         }
                         msg = ProtocolMessage.serialize("FRAME", meta, binary_data=encrypted)
                         await websocket.send(msg)
@@ -848,6 +906,7 @@ class HostDaemon:
             if is_our_session:
                 self._streaming_active = False
                 self._webrtc_active = False
+                self._webrtc_video_active = False
                 if self._stream_task is cur_task:
                     self._stream_task = None
                 self._in_flight_fids.clear()
@@ -1157,6 +1216,7 @@ class HostDaemon:
         self.running = False
         self._streaming_active = False
         self._webrtc_active = False
+        self._webrtc_video_active = False
         if hasattr(self, "native_engine") and self.native_engine:
             self.native_engine.destroy_host_session()
         self.prevent_sleep(False)
@@ -1219,6 +1279,17 @@ class HostDaemon:
             except Exception:
                 pass
 
+        worker_alive = bool(
+            hasattr(self, "input_worker") and self.input_worker and
+            getattr(self.input_worker, "_thread", None) and
+            self.input_worker._thread.is_alive()
+        )
+        if hasattr(self, "input_handler") and self.input_handler and not worker_alive:
+            try:
+                self.input_handler.close()
+            except Exception:
+                pass
+
         # 7. Cancel and remove partial file transfers
         if hasattr(self, "file_transfer") and self.file_transfer:
             self.file_transfer.cancel_all_transfers()
@@ -1237,6 +1308,7 @@ class HostDaemon:
         """Synchronous cleanup fallback if the owning loop is not running."""
         self.running = False
         self._webrtc_active = False
+        self._webrtc_video_active = False
         if hasattr(self, "native_engine") and self.native_engine:
             self.native_engine.destroy_host_session()
         self.prevent_sleep(False)
@@ -1249,6 +1321,17 @@ class HostDaemon:
         elif hasattr(self, "input_handler") and self.input_handler:
             try:
                 self.input_handler.release_all_inputs()
+            except Exception:
+                pass
+
+        worker_alive = bool(
+            hasattr(self, "input_worker") and self.input_worker and
+            getattr(self.input_worker, "_thread", None) and
+            self.input_worker._thread.is_alive()
+        )
+        if hasattr(self, "input_handler") and self.input_handler and not worker_alive:
+            try:
+                self.input_handler.close()
             except Exception:
                 pass
         if hasattr(self, "_broadcaster") and self._broadcaster:

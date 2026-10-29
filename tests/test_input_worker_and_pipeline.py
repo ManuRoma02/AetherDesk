@@ -308,9 +308,9 @@ def test_input_worker_flush_waits_for_executing_command():
     handler = InputHandler(injector=mock_inj)
 
     original_key_down = handler.key_down
-    def slow_key_down(vk):
+    def slow_key_down(vk, seq=None):
         time.sleep(0.08)
-        return original_key_down(vk)
+        return original_key_down(vk, seq=seq)
     handler.key_down = slow_key_down
 
     worker = InputWorker(handler, maxsize=16)
@@ -525,7 +525,7 @@ def test_flush_atomic_no_gap_between_pop_and_executing():
 
     # Hook handler to record state during execution
     executed = []
-    def slow_exec(vk):
+    def slow_exec(vk, seq=None):
         # Under queue._lock, is_idle MUST be False while executing
         assert worker.queue.is_idle() is False
         time.sleep(0.04)

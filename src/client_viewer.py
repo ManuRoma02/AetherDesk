@@ -19,6 +19,10 @@ import asyncio
 import threading
 import ctypes
 from pathlib import Path
+from typing import Optional
+import logging
+
+logger = logging.getLogger("ClientViewer")
 
 # Ensure project root is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1769,9 +1773,13 @@ class ClientViewerGUI:
                 fps_val = self._current_fps
                 avg_lat = round(sum(self._latencies) / len(self._latencies), 1) if self._latencies else 0.0
                 avg_rnd = round(sum(self._render_latencies) / len(self._render_latencies), 1) if self._render_latencies else 0.0
-                lat_str = f" | {avg_lat}ms" if avg_lat > 0 else ""
+                transport_str = telemetry.get("transport")
+                if not transport_str:
+                    transport_str = "WebRTC H.264" if telemetry.get("webrtc") else "WS JPEG"
+                transport_tag = f"[{transport_str}]"
+                lat_str = f" | RTT {avg_lat}ms" if avg_lat > 0 else ""
                 rnd_str = f" (gui {avg_rnd}ms)" if avg_rnd > 0 else ""
-                self.lbl_fps.config(text=f"FPS: {fps_val}{lat_str}{rnd_str}")
+                self.lbl_fps.config(text=f"{transport_tag} FPS: {fps_val}{lat_str}{rnd_str}")
 
         try:
             if frame_bytes.startswith(b"\xff\xd8"):
@@ -1938,8 +1946,14 @@ class ClientViewerGUI:
 
         self._last_mouse_send_time = now
         self._pending_mouse_coords = None
+        cnt = getattr(self, "_mouse_gen_count", 0) + 1
+        self._mouse_gen_count = cnt
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
+        if cnt % 100 == 0:
+            logger.debug(f"[INPUT_GEN] action=mouse_move count={cnt} last_seq={seq}")
         asyncio.run_coroutine_threadsafe(
-            self.client.send_input({"type": "mouse_move", "x": nx, "y": ny}),
+            self.client.send_input({"type": "mouse_move", "x": nx, "y": ny, "seq": seq}),
             self.loop
         )
 
@@ -1949,8 +1963,10 @@ class ClientViewerGUI:
         if coords and self.client and self.client.state.is_connected:
             self._last_mouse_send_time = time.time()
             self._pending_mouse_coords = None
+            seq = getattr(self, "_input_gen_seq", 0) + 1
+            self._input_gen_seq = seq
             asyncio.run_coroutine_threadsafe(
-                self.client.send_input({"type": "mouse_move", "x": coords[0], "y": coords[1]}),
+                self.client.send_input({"type": "mouse_move", "x": coords[0], "y": coords[1], "seq": seq}),
                 self.loop
             )
 
@@ -1967,12 +1983,16 @@ class ClientViewerGUI:
                 pass
         self._pending_mouse_coords = None
         nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
         cmd = {
             "type": f"mouse_{action}",
             "button": button,
             "x": nx,
-            "y": ny
+            "y": ny,
+            "seq": seq,
         }
+        logger.info(f"[INPUT_GEN] seq={seq} action=mouse_{action} button={button}")
         asyncio.run_coroutine_threadsafe(self.client.send_input(cmd), self.loop)
 
     def _on_double_click(self, event, button: str):
@@ -1981,31 +2001,43 @@ class ClientViewerGUI:
     def _on_mouse_wheel(self, event, mon_idx: int = 0):
         nx, ny = self._calc_norm_coords(event, mon_idx=mon_idx)
         delta = event.delta
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
+        logger.info(f"[INPUT_GEN] seq={seq} action=mouse_wheel")
         asyncio.run_coroutine_threadsafe(
-            self.client.send_input({"type": "mouse_wheel", "delta": delta, "x": nx, "y": ny}),
+            self.client.send_input({"type": "mouse_wheel", "delta": delta, "x": nx, "y": ny, "seq": seq}),
             self.loop
         )
 
     def _on_key_press(self, event):
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
         vk = event.keycode
-        payload = {"type": "key_down", "vk": vk}
+        payload = {"type": "key_down", "vk": vk, "seq": seq}
         if event.char and len(event.char) == 1 and ord(event.char) >= 32:
             payload["char"] = event.char
+        logger.info(f"[INPUT_GEN] seq={seq} action=key_down")
         asyncio.run_coroutine_threadsafe(
             self.client.send_input(payload),
             self.loop
         )
 
     def _on_key_release(self, event):
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
         vk = event.keycode
+        logger.info(f"[INPUT_GEN] seq={seq} action=key_up")
         asyncio.run_coroutine_threadsafe(
-            self.client.send_input({"type": "key_up", "vk": vk}),
+            self.client.send_input({"type": "key_up", "vk": vk, "seq": seq}),
             self.loop
         )
 
     def _send_special(self, cmd: str):
+        seq = getattr(self, "_input_gen_seq", 0) + 1
+        self._input_gen_seq = seq
+        logger.info(f"[INPUT_GEN] seq={seq} action=special cmd={cmd}")
         asyncio.run_coroutine_threadsafe(
-            self.client.send_input({"type": "special", "command": cmd}),
+            self.client.send_input({"type": "special", "command": cmd, "seq": seq}),
             self.loop
         )
 

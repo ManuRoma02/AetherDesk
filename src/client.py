@@ -574,7 +574,11 @@ class RemoteClient:
                         "clock_offset_ms": None,
                         "jitter_ms": None,
                         "size_bytes": len(binary),
-                        "webrtc": False,
+                        "webrtc": payload.get("webrtc", False) if isinstance(payload, dict) else False,
+                        "transport": payload.get("transport", "WebSocket JPEG") if isinstance(payload, dict) else "WebSocket JPEG",
+                        "backend": payload.get("backend", "GDI/Pillow") if isinstance(payload, dict) else "GDI/Pillow",
+                        "in_flight": payload.get("in_flight", 0) if isinstance(payload, dict) else 0,
+                        "dropped_acks": payload.get("dropped_acks", 0) if isinstance(payload, dict) else 0,
                     }
                     try:
                         host_rtt = payload.get("rtt_ms") if isinstance(payload, dict) else None
@@ -791,6 +795,8 @@ class RemoteClient:
                                 "jitter_ms": jitter_measured,
                                 "size_bytes": len(raw_bytes),
                                 "webrtc": True,
+                                "transport": "WebRTC H.264",
+                                "backend": "DXGI / MediaFoundation",
                             }
                             if self.on_frame_callback:
                                 try:
@@ -985,25 +991,36 @@ class RemoteClient:
         if not self.state.is_connected or not self.state.session_key:
             return
 
+        action = input_dict.get("type", "")
+        seq = input_dict.get("seq")
+        if seq is None:
+            self._input_seq = getattr(self, "_input_seq", 0) + 1
+            seq = self._input_seq
+            input_dict["seq"] = seq
+
         # Segregated transport: when native WebRTC is active, route through dedicated channels
         if self._webrtc_active and self.native_engine.is_native_loaded and self.native_engine.client_handle:
-            if input_dict.get("type") == "mouse_move":
-                self._cursor_seq = getattr(self, "_cursor_seq", 0) + 1
-                seq = self._cursor_seq
+            if action == "mouse_move":
                 norm_x = float(input_dict.get("x", 0.0))
                 norm_y = float(input_dict.get("y", 0.0))
                 w, h = self.state.host_dims
                 px = int(norm_x * w) if norm_x <= 1.0 else int(norm_x)
                 py = int(norm_y * h) if norm_y <= 1.0 else int(norm_y)
+                cnt = getattr(self, "_send_webrtc_cursor_count", 0) + 1
+                self._send_webrtc_cursor_count = cnt
+                if cnt % 100 == 0:
+                    logger.debug(f"[INPUT_SEND] transport=webrtc_cursor move_count={cnt} last_seq={seq}")
                 if self.native_engine.send_client_cursor(px, py, seq):
                     return
             else:
+                input_dict["transport"] = "webrtc_control"
                 payload_bytes = json.dumps(input_dict).encode("utf-8")
                 enc_payload = self.security.encrypt_packet(payload_bytes, self.state.session_key)
                 ctrl_packet = ProtocolMessage.serialize("INPUT", {
                     "target_id": self.state.target_id,
                     "channel": "control"
                 }, binary_data=enc_payload)
+                logger.info(f"[INPUT_SEND] seq={seq} transport=webrtc_control action={action}")
                 if self.native_engine.send_client_control(ctrl_packet):
                     return
 
@@ -1011,13 +1028,17 @@ class RemoteClient:
         if not self.websocket:
             return
 
-        if input_dict.get("type") == "mouse_move":
-            self._cursor_seq = getattr(self, "_cursor_seq", 0) + 1
-            input_dict["seq"] = self._cursor_seq
-            input_dict["t"] = time.perf_counter_ns()
+        input_dict["transport"] = "websocket"
+        if action == "mouse_move":
             channel_priority = "cursor"
+            input_dict["t"] = time.perf_counter_ns()
+            cnt = getattr(self, "_send_ws_move_count", 0) + 1
+            self._send_ws_move_count = cnt
+            if cnt % 100 == 0:
+                logger.debug(f"[INPUT_SEND] transport=websocket move_count={cnt} last_seq={seq}")
         else:
             channel_priority = "control"
+            logger.info(f"[INPUT_SEND] seq={seq} transport=websocket action={action} channel={channel_priority}")
 
         payload_bytes = json.dumps(input_dict).encode("utf-8")
         encrypted = self.security.encrypt_packet(payload_bytes, self.state.session_key)

@@ -3,6 +3,11 @@ from ctypes import wintypes
 import time
 import sys
 import os
+import threading
+import logging
+from typing import Optional
+
+logger = logging.getLogger("InputHandler")
 
 def is_test_environment() -> bool:
     """Check if Python process is running within pytest or test discovery."""
@@ -121,6 +126,113 @@ class INPUT(ctypes.Structure):
         ("union", _INPUT_UNION)
     ]
 
+class TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+class SID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Sid", ctypes.c_void_p),
+        ("Attributes", wintypes.DWORD),
+    ]
+
+class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+    _fields_ = [
+        ("Label", SID_AND_ATTRIBUTES),
+    ]
+
+def get_windows_process_context() -> dict:
+    """
+    Query current process session ID, token elevation, and integrity level.
+    Provides diagnostic clarity on UIPI constraints and secure desktop access.
+    """
+    ctx = {
+        "session_id": None,
+        "is_elevated": False,
+        "integrity_level": "Unknown",
+        "integrity_level_code": 0,
+        "can_uipi_bypass": False,
+    }
+    if sys.platform != "win32":
+        return ctx
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        advapi32 = ctypes.windll.advapi32
+
+        # Explicit 64-bit signatures for kernel32 process context APIs
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcessId.argtypes = []
+        kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+        kernel32.GetCurrentThreadId.argtypes = []
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        # Explicit 64-bit signatures for advapi32 security token APIs
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        advapi32.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+
+        # 1. Session ID
+        session_id = wintypes.DWORD()
+        if kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session_id)):
+            ctx["session_id"] = session_id.value
+
+        # 2. Open process token
+        TOKEN_QUERY = 0x0008
+        token_handle = wintypes.HANDLE()
+        if advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token_handle)):
+            try:
+                # TokenElevation = 20
+                elevation = TOKEN_ELEVATION()
+                ret_len = wintypes.DWORD()
+                if advapi32.GetTokenInformation(token_handle, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(ret_len)):
+                    ctx["is_elevated"] = bool(elevation.TokenIsElevated)
+
+                # TokenIntegrityLevel = 25
+                buf = ctypes.create_string_buffer(128)
+                if advapi32.GetTokenInformation(token_handle, 25, buf, ctypes.sizeof(buf), ctypes.byref(ret_len)):
+                    tml = ctypes.cast(buf, ctypes.POINTER(TOKEN_MANDATORY_LABEL)).contents
+                    sid_ptr = tml.Label.Sid
+                    if sid_ptr:
+                        count_ptr = advapi32.GetSidSubAuthorityCount(sid_ptr)
+                        if count_ptr and count_ptr.contents.value > 0:
+                            sub_auth_ptr = advapi32.GetSidSubAuthority(sid_ptr, count_ptr.contents.value - 1)
+                            if sub_auth_ptr:
+                                rid = sub_auth_ptr.contents.value
+                                ctx["integrity_level_code"] = rid
+                                if rid >= 0x4000:
+                                    ctx["integrity_level"] = "System"
+                                elif rid >= 0x3000:
+                                    ctx["integrity_level"] = "High (Administrator)"
+                                elif rid >= 0x2000:
+                                    ctx["integrity_level"] = "Medium (Standard User)"
+                                elif rid >= 0x1000:
+                                    ctx["integrity_level"] = "Low"
+                                else:
+                                    ctx["integrity_level"] = "Untrusted"
+            finally:
+                kernel32.CloseHandle(token_handle)
+    except Exception:
+        pass
+
+    ctx["can_uipi_bypass"] = ctx["is_elevated"] or (ctx["integrity_level_code"] >= 0x3000)
+    return ctx
+
 class WindowsInputInjector:
     """Production Windows input injector using Win32 API via ctypes."""
 
@@ -131,8 +243,119 @@ class WindowsInputInjector:
                 "Use MockInputInjector instead."
             )
         self.user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
+        self._lock = threading.Lock()
         self._winsta_initialized = False
         self._last_desktop_check = 0.0
+        self._current_hdesk = None
+        self._current_desktop_name = None
+        self._setup_ctypes_signatures()
+        self._privilege_ctx = get_windows_process_context()
+        logger.info(
+            f"[PRIVILEGE] Host context: Session={self._privilege_ctx.get('session_id')}, "
+            f"Integrity={self._privilege_ctx.get('integrity_level')}, "
+            f"Elevated={self._privilege_ctx.get('is_elevated')}"
+        )
+        if not self._privilege_ctx.get("is_elevated"):
+            logger.info(
+                "[PRIVILEGE] Running with standard user rights. Input injection into elevated windows "
+                "on the interactive desktop is restricted by UIPI. Running Host as Administrator enables UIPI bypass "
+                "for elevated windows on the interactive desktop. Note: The UAC Secure Desktop (Winlogon) is not "
+                "accessible to interactive user processes."
+            )
+        else:
+            logger.info(
+                "[PRIVILEGE] Running with administrative privileges (UIPI bypass enabled on interactive desktop). "
+                "Note: The UAC Secure Desktop (Winlogon) remains isolated and is not accessible."
+            )
+
+    def _setup_ctypes_signatures(self):
+        """Declare explicit 64-bit argument and return types for user32 Win32 API."""
+        if not self.user32:
+            return
+        try:
+            self.user32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+            self.user32.OpenWindowStationW.restype = wintypes.HANDLE
+
+            self.user32.GetProcessWindowStation.argtypes = []
+            self.user32.GetProcessWindowStation.restype = wintypes.HANDLE
+
+            self.user32.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
+            self.user32.SetProcessWindowStation.restype = wintypes.BOOL
+
+            self.user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            self.user32.OpenInputDesktop.restype = wintypes.HANDLE
+
+            self.user32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+            self.user32.SetThreadDesktop.restype = wintypes.BOOL
+
+            self.user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+            self.user32.CloseDesktop.restype = wintypes.BOOL
+
+            self.user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+            self.user32.GetThreadDesktop.restype = wintypes.HANDLE
+
+            self.user32.GetUserObjectInformationW.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self.user32.GetUserObjectInformationW.restype = wintypes.BOOL
+
+            self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+            self.user32.SendInput.restype = wintypes.UINT
+
+            self.user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+            self.user32.SetCursorPos.restype = wintypes.BOOL
+
+            self.user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+            self.user32.GetCursorPos.restype = wintypes.BOOL
+
+            self.user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            self.user32.GetSystemMetrics.restype = ctypes.c_int
+
+            self.user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_ulonglong]
+            self.user32.mouse_event.restype = None
+
+            self.user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_ulonglong]
+            self.user32.keybd_event.restype = None
+
+            if hasattr(self.user32, "MapVirtualKeyW"):
+                self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+                self.user32.MapVirtualKeyW.restype = wintypes.UINT
+        except Exception as e:
+            logger.debug(f"Failed to bind ctypes signatures: {e}")
+
+    def _get_qualified_desktop_name(self, hdesk) -> str:
+        """
+        Query fully qualified desktop name (WindowStation\\Desktop) via GetUserObjectInformationW.
+        Differentiates homonymous desktops across distinct window stations.
+        """
+        if not hdesk or not self.user32 or not hasattr(self.user32, "GetUserObjectInformationW"):
+            return ""
+        desk_name = ""
+        buf = ctypes.create_unicode_buffer(256)
+        needed = wintypes.DWORD()
+        UOI_NAME = 2
+        try:
+            if self.user32.GetUserObjectInformationW(hdesk, UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed)):
+                desk_name = buf.value
+        except Exception:
+            return ""
+
+        winsta_name = ""
+        if hasattr(self.user32, "GetProcessWindowStation"):
+            try:
+                hwinsta = self.user32.GetProcessWindowStation()
+                if hwinsta and self.user32.GetUserObjectInformationW(hwinsta, UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed)):
+                    winsta_name = buf.value
+            except Exception:
+                pass
+
+        if winsta_name and desk_name:
+            return f"{winsta_name}\\{desk_name}".lower()
+        return desk_name.lower()
 
     def ensure_input_desktop(self, force: bool = False) -> bool:
         now = time.time()
@@ -140,27 +363,85 @@ class WindowsInputInjector:
             return True
         self._last_desktop_check = now
 
-        if not self._winsta_initialized:
-            try:
-                hwinsta = self.user32.OpenWindowStationW("WinSta0", False, 0x037F)
-                if hwinsta:
-                    self.user32.SetProcessWindowStation(hwinsta)
-                    self._winsta_initialized = True
-            except Exception:
-                pass
+        with self._lock:
+            if not self._winsta_initialized and self.user32:
+                try:
+                    hwinsta = self.user32.OpenWindowStationW("WinSta0", False, 0x037F)
+                    if hwinsta:
+                        self.user32.SetProcessWindowStation(hwinsta)
+                        self._winsta_initialized = True
+                except Exception as e:
+                    logger.debug(f"[DESKTOP] OpenWindowStationW exception: {e}")
 
-        try:
-            flags = 0x0001 | 0x0040 | 0x0100
-            hdesk = self.user32.OpenInputDesktop(0, False, flags)
-            if not hdesk:
-                hdesk = self.user32.OpenInputDesktop(0, False, 0x0001 | 0x0100)
-            if hdesk:
-                res = self.user32.SetThreadDesktop(hdesk)
-                self.user32.CloseDesktop(hdesk)
-                return bool(res)
-        except Exception:
-            pass
-        return False
+            if not self.user32:
+                return False
+
+            try:
+                flags = 0x0001 | 0x0040 | 0x0100  # DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP
+                hdesk = self.user32.OpenInputDesktop(0, False, flags)
+                if not hdesk:
+                    hdesk = self.user32.OpenInputDesktop(0, False, 0x0001 | 0x0100)
+
+                if not hdesk:
+                    err = ctypes.GetLastError()
+                    logger.debug(
+                        f"[DESKTOP] OpenInputDesktop returned NULL (Win32 err={err}). "
+                        "Active desktop may be isolated (e.g. Secure Desktop or locked workstation)."
+                    )
+                    return False
+
+                # Query fully-qualified input desktop name
+                input_desk_name = self._get_qualified_desktop_name(hdesk)
+
+                # Query calling thread's current desktop name
+                kernel32 = getattr(ctypes.windll, "kernel32", None)
+                thread_id = kernel32.GetCurrentThreadId() if kernel32 else 0
+                h_thread = self.user32.GetThreadDesktop(thread_id) if hasattr(self.user32, "GetThreadDesktop") else None
+                thread_desk_name = self._get_qualified_desktop_name(h_thread) if h_thread else (self._current_desktop_name or "")
+
+                # Note on Win32 semantics: handles returned by OpenInputDesktop must be closed with CloseDesktop.
+                # Handles returned by GetThreadDesktop do NOT need to be closed with CloseDesktop.
+                # Comparing raw handle integers (hdesk != _current_hdesk) is invalid because separate
+                # OpenInputDesktop calls return distinct handle values for the same underlying desktop object.
+                if thread_desk_name and input_desk_name and thread_desk_name == input_desk_name:
+                    # Thread is already attached to this desktop: close temporary handle to avoid leak
+                    # and avoid redundant SetThreadDesktop which fails if windows or hooks exist.
+                    self.user32.CloseDesktop(hdesk)
+                    self._current_desktop_name = input_desk_name
+                    return True
+
+                # Desktop has transitioned (e.g. Default -> Winlogon or vice-versa): switch thread desktop
+                assigned = self.user32.SetThreadDesktop(hdesk)
+                if assigned:
+                    # Close previously held desktop handle only after successfully switching
+                    if self._current_hdesk:
+                        try:
+                            self.user32.CloseDesktop(self._current_hdesk)
+                        except Exception:
+                            pass
+                    self._current_hdesk = hdesk
+                    self._current_desktop_name = input_desk_name
+                    logger.info(f"[DESKTOP] InputWorkerThread assigned to active input desktop: {input_desk_name}")
+                    return True
+                else:
+                    err = ctypes.GetLastError()
+                    logger.warning(f"[DESKTOP] SetThreadDesktop failed with Win32 err={err} for desktop '{input_desk_name}'")
+                    self.user32.CloseDesktop(hdesk)
+                    return False
+            except Exception as e:
+                logger.debug(f"[DESKTOP] ensure_input_desktop error: {e}")
+                return False
+
+    def close(self):
+        """Release assigned desktop handle on shutdown (thread-safe, idempotent)."""
+        with self._lock:
+            if self._current_hdesk and self.user32:
+                try:
+                    self.user32.CloseDesktop(self._current_hdesk)
+                except Exception:
+                    pass
+                self._current_hdesk = None
+                self._current_desktop_name = None
 
     def get_system_metrics(self, index: int) -> int:
         return self.user32.GetSystemMetrics(index)
@@ -171,8 +452,13 @@ class WindowsInputInjector:
     def send_input(self, inp: INPUT) -> bool:
         res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
         if res == 0:
+            err = ctypes.GetLastError()
+            logger.debug(f"[INPUT_INJECT] SendInput returned 0 (Win32 err={err}). Re-syncing desktop...")
             self.ensure_input_desktop(force=True)
             res = self.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+            if res == 0:
+                err2 = ctypes.GetLastError()
+                logger.warning(f"[INPUT_INJECT] SendInput retry failed (Win32 err={err2})")
         return res > 0
 
     def mouse_event(self, flags: int, dx: int, dy: int, data: int, extra_info: int) -> None:
@@ -193,10 +479,14 @@ class MockInputInjector:
         self.mouse_events = []
         self.keybd_events = []
         self.desktop_ensured_count = 0
+        self.closed = False
 
     def ensure_input_desktop(self, force: bool = False) -> bool:
         self.desktop_ensured_count += 1
         return True
+
+    def close(self):
+        self.closed = True
 
     def get_system_metrics(self, index: int) -> int:
         if index in (0, 78):
@@ -224,8 +514,8 @@ class MockInputInjector:
 
 class InputHandler:
     """
-    TeamViewer-grade input injection engine:
-    - Auto-switches thread to active input desktop (UAC/lockscreen/worker thread support).
+    Remote input injection engine:
+    - Attaches thread to active input desktop when accessible (reports access denial on Secure Desktop).
     - Uses SetCursorPos for pixel accuracy + SendInput with mouse_event/keybd_event fallback.
     - Full multi-monitor and virtual desktop coordinate transformation.
     """
@@ -256,8 +546,16 @@ class InputHandler:
         self._pressed_keys = set()
         self._pressed_mouse_buttons = set()
 
+    def close(self):
+        """Release assigned desktop handle and resources held by the injector."""
+        if hasattr(self.injector, "close"):
+            try:
+                self.injector.close()
+            except Exception as e:
+                logger.debug(f"InputHandler close error: {e}")
+
     def _ensure_input_desktop(self, force: bool = False) -> bool:
-        """Attach caller thread to active Windows input desktop (handles UAC/lockscreen/worker threads)."""
+        """Attach caller thread to active Windows input desktop when accessible."""
         return self.injector.ensure_input_desktop(force=force)
 
     def get_screen_bounds(self) -> tuple[int, int]:
@@ -324,7 +622,7 @@ class InputHandler:
 
         return (pixel_x, pixel_y, abs_x, abs_y)
 
-    def move_mouse_relative(self, dx: float, dy: float) -> tuple[int, int]:
+    def move_mouse_relative(self, dx: float, dy: float, seq: Optional[int] = None) -> tuple[int, int]:
         """Move cursor relatively (for virtual trackpad / relative mouse mode)."""
         if self.user32 and hasattr(self.user32, "GetCursorPos"):
             pos = ctypes.wintypes.POINT()
@@ -338,19 +636,25 @@ class InputHandler:
         new_x = cur_x + int(dx)
         new_y = cur_y + int(dy)
 
+        ok = True
         if self.user32 and hasattr(self.user32, "SetCursorPos"):
             if not self.user32.SetCursorPos(new_x, new_y):
                 self._ensure_input_desktop(force=True)
-                self.user32.SetCursorPos(new_x, new_y)
+                ok = bool(self.user32.SetCursorPos(new_x, new_y))
         elif hasattr(self.injector, "set_cursor_pos"):
-            self.injector.set_cursor_pos(new_x, new_y)
+            ok = bool(self.injector.set_cursor_pos(new_x, new_y))
 
         self.last_pixel_pos = (new_x, new_y)
+        cnt = getattr(self, "_rel_move_count", 0) + 1
+        self._rel_move_count = cnt
+        if cnt % 100 == 0:
+            logger.debug(f"[INPUT_INJECT] seq={seq} action=move_relative move_count={cnt} set_cursor_pos={ok}")
         return (new_x, new_y)
 
     def move_mouse(self, norm_x: float, norm_y: float,
                    monitor_bounds: tuple[int, int, int, int] = None,
-                   virtual_bounds: tuple[int, int, int, int] = None) -> tuple[int, int]:
+                   virtual_bounds: tuple[int, int, int, int] = None,
+                   seq: Optional[int] = None) -> tuple[int, int]:
         """Move cursor using physical SetCursorPos and SendInput virtual desk coordinates."""
         pixel_x, pixel_y, abs_x, abs_y = self._calc_coords(norm_x, norm_y, monitor_bounds, virtual_bounds)
         self.last_pixel_pos = (pixel_x, pixel_y)
@@ -362,20 +666,27 @@ class InputHandler:
         inp.union.mi.dx = abs_x
         inp.union.mi.dy = abs_y
         inp.union.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-        if not self._send_input(inp):
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
             # Fallback for desktops where absolute SendInput is unavailable.
             self.injector.mouse_event(
                 MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 abs_x, abs_y, 0, 0
             )
+        cnt = getattr(self, "_injected_move_count", 0) + 1
+        self._injected_move_count = cnt
+        if cnt % 100 == 0:
+            logger.debug(f"[INPUT_INJECT] seq={seq} action=mouse_move move_count={cnt} send_input_inserted={ok} fallback_attempted={fallback}")
         return (pixel_x, pixel_y)
 
     def mouse_down(self, button = "left", norm_x: float = None, norm_y: float = None,
-                   monitor_bounds=None, virtual_bounds=None):
+                   monitor_bounds=None, virtual_bounds=None, seq: Optional[int] = None):
         button = normalize_button(button)
         self._pressed_mouse_buttons.add(button)
         if norm_x is not None and norm_y is not None:
-            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
+            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds, seq=seq)
 
         flag = MOUSEEVENTF_LEFTDOWN
         if button == "right":
@@ -390,15 +701,19 @@ class InputHandler:
         inp.union.mi.dy = 0
         inp.union.mi.dwExtraInfo = 100
 
-        if not self._send_input(inp):
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
             self.injector.mouse_event(flag, 0, 0, 0, 0)
+        logger.info(f"[INPUT_INJECT] seq={seq} action=mouse_down button={button} send_input_inserted={ok} fallback_attempted={fallback}")
 
     def mouse_up(self, button = "left", norm_x: float = None, norm_y: float = None,
-                 monitor_bounds=None, virtual_bounds=None):
+                 monitor_bounds=None, virtual_bounds=None, seq: Optional[int] = None):
         button = normalize_button(button)
         self._pressed_mouse_buttons.discard(button)
         if norm_x is not None and norm_y is not None:
-            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
+            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds, seq=seq)
 
         flag = MOUSEEVENTF_LEFTUP
         if button == "right":
@@ -413,63 +728,95 @@ class InputHandler:
         inp.union.mi.dy = 0
         inp.union.mi.dwExtraInfo = 100
 
-        if not self._send_input(inp):
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
             self.injector.mouse_event(flag, 0, 0, 0, 0)
+        logger.info(f"[INPUT_INJECT] seq={seq} action=mouse_up button={button} send_input_inserted={ok} fallback_attempted={fallback}")
 
     def mouse_click(self, button = "left", norm_x: float = None, norm_y: float = None,
-                    monitor_bounds=None, virtual_bounds=None):
+                    monitor_bounds=None, virtual_bounds=None, seq: Optional[int] = None):
         """Execute full click with mandatory hardware delay so Windows UI registers the event."""
         button = normalize_button(button)
         if norm_x is not None and norm_y is not None:
-            self.move_mouse(norm_x, norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
-        self.mouse_down(button)
+            self.move_mouse(norm_x, norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds, seq=seq)
+        self.mouse_down(button, seq=seq)
         time.sleep(0.025)
-        self.mouse_up(button)
+        self.mouse_up(button, seq=seq)
 
     def mouse_double_click(self, button = "left", norm_x: float = None, norm_y: float = None,
-                           monitor_bounds=None, virtual_bounds=None):
-        self.mouse_click(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
+                           monitor_bounds=None, virtual_bounds=None, seq: Optional[int] = None):
+        self.mouse_click(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds, seq=seq)
         time.sleep(0.05)
-        self.mouse_click(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds)
+        self.mouse_click(button, norm_x=norm_x, norm_y=norm_y, monitor_bounds=monitor_bounds, virtual_bounds=virtual_bounds, seq=seq)
 
     def mouse_wheel(self, delta: int, norm_x: float = None, norm_y: float = None,
-                    monitor_bounds=None, virtual_bounds=None):
+                    monitor_bounds=None, virtual_bounds=None, seq: Optional[int] = None):
         if norm_x is not None and norm_y is not None:
-            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds)
+            self.move_mouse(norm_x, norm_y, monitor_bounds, virtual_bounds, seq=seq)
 
         self._ensure_input_desktop()
         inp = INPUT()
         inp.type = INPUT_MOUSE
         inp.union.mi.dwFlags = MOUSEEVENTF_WHEEL
         inp.union.mi.mouseData = delta
-        if not self._send_input(inp):
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
             self.injector.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0)
+        logger.info(f"[INPUT_INJECT] seq={seq} action=mouse_wheel send_input_inserted={ok} fallback_attempted={fallback}")
 
-    def key_down(self, vk_code: int):
+    def key_down(self, vk_code: int, seq: Optional[int] = None):
         self._pressed_keys.add(vk_code)
         flags = KEYEVENTF_KEYDOWN
         if vk_code in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C):
             flags |= KEYEVENTF_EXTENDEDKEY
 
+        wScan = 0
+        if self.user32 and hasattr(self.user32, "MapVirtualKeyW"):
+            try:
+                wScan = self.user32.MapVirtualKeyW(vk_code, 0)
+            except Exception:
+                wScan = 0
+
         inp = INPUT()
         inp.type = INPUT_KEYBOARD
         inp.union.ki.wVk = vk_code
+        inp.union.ki.wScan = wScan
         inp.union.ki.dwFlags = flags
-        if not self._send_input(inp):
-            self.injector.keybd_event(vk_code, 0, flags, 0)
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
+            self.injector.keybd_event(vk_code, wScan, flags, 0)
+        logger.info(f"[INPUT_INJECT] seq={seq} action=key_down send_input_inserted={ok} fallback_attempted={fallback}")
 
-    def key_up(self, vk_code: int):
+    def key_up(self, vk_code: int, seq: Optional[int] = None):
         self._pressed_keys.discard(vk_code)
         flags = KEYEVENTF_KEYUP
         if vk_code in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x5B, 0x5C):
             flags |= KEYEVENTF_EXTENDEDKEY
 
+        wScan = 0
+        if self.user32 and hasattr(self.user32, "MapVirtualKeyW"):
+            try:
+                wScan = self.user32.MapVirtualKeyW(vk_code, 0)
+            except Exception:
+                wScan = 0
+
         inp = INPUT()
         inp.type = INPUT_KEYBOARD
         inp.union.ki.wVk = vk_code
+        inp.union.ki.wScan = wScan
         inp.union.ki.dwFlags = flags
-        if not self._send_input(inp):
-            self.injector.keybd_event(vk_code, 0, flags, 0)
+        ok = self._send_input(inp)
+        fallback = False
+        if not ok:
+            fallback = True
+            self.injector.keybd_event(vk_code, wScan, flags, 0)
+        logger.info(f"[INPUT_INJECT] seq={seq} action=key_up send_input_inserted={ok} fallback_attempted={fallback}")
 
     def release_all_mouse_buttons(self):
         """Release all currently pressed mouse buttons to avoid stuck drag states."""
@@ -508,33 +855,37 @@ class InputHandler:
         """Release both keyboard keys and mouse buttons."""
         self.release_all_keys()
 
-    def send_unicode_char(self, char_or_text: str):
+    def send_unicode_char(self, char_or_text: str, seq: Optional[int] = None):
         """Send unicode character or full text string directly (immune to layout differences)."""
         if not char_or_text:
             return
         self._ensure_input_desktop()
+        all_inserted = True
         for char in str(char_or_text):
             code = ord(char)
             inp_down = INPUT()
             inp_down.type = INPUT_KEYBOARD
             inp_down.union.ki.wScan = code
             inp_down.union.ki.dwFlags = KEYEVENTF_UNICODE
-            self._send_input(inp_down)
+            ok_down = self._send_input(inp_down)
 
             inp_up = INPUT()
             inp_up.type = INPUT_KEYBOARD
             inp_up.union.ki.wScan = code
             inp_up.union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
-            self._send_input(inp_up)
+            ok_up = self._send_input(inp_up)
+            if not ok_down or not ok_up:
+                all_inserted = False
+        logger.info(f"[INPUT_INJECT] seq={seq} action=unicode_char send_input_inserted={all_inserted} chars_count={len(str(char_or_text))}")
 
-    def send_key_combination(self, vk_list: list[int]):
+    def send_key_combination(self, vk_list: list[int], seq: Optional[int] = None):
         for vk in vk_list:
-            self.key_down(vk)
+            self.key_down(vk, seq=seq)
         time.sleep(0.02)
         for vk in reversed(vk_list):
-            self.key_up(vk)
+            self.key_up(vk, seq=seq)
 
-    def send_key_combination_by_names(self, key_names: list[str]) -> bool:
+    def send_key_combination_by_names(self, key_names: list[str], seq: Optional[int] = None) -> bool:
         vks = []
         for name in key_names:
             clean = str(name).lower().strip()
@@ -543,86 +894,86 @@ class InputHandler:
             elif len(clean) == 1 and clean.isalnum():
                 vks.append(VK_MAP.get(clean, ord(clean.upper())))
         if vks:
-            self.send_key_combination(vks)
+            self.send_key_combination(vks, seq=seq)
             return True
         return False
 
-    def send_shortcut(self, shortcut: str) -> bool:
+    def send_shortcut(self, shortcut: str, seq: Optional[int] = None) -> bool:
         """Parse shortcut string like 'ctrl+c', 'ctrl+alt+del', 'shift+tab'."""
         parts = [p.strip().lower() for p in shortcut.replace("-", "+").split("+")]
-        return self.send_key_combination_by_names(parts)
+        return self.send_key_combination_by_names(parts, seq=seq)
 
-    def send_special(self, command: str) -> bool:
+    def send_special(self, command: str, seq: Optional[int] = None) -> bool:
         """Execute special system key combinations and clipboard shortcuts."""
         cmd = command.lower().strip().replace(" ", "_").replace("-", "_")
         self._ensure_input_desktop()
 
         # Clipboard shortcuts (Ctrl+C, Ctrl+V, etc.)
         if cmd in ("copy", "ctrl_c", "ctrl+c"):
-            self.send_key_combination([VK_CONTROL, 0x43]) # Ctrl+C
+            self.send_key_combination([VK_CONTROL, 0x43], seq=seq) # Ctrl+C
             return True
         elif cmd in ("paste", "ctrl_v", "ctrl+v"):
-            self.send_key_combination([VK_CONTROL, 0x56]) # Ctrl+V
+            self.send_key_combination([VK_CONTROL, 0x56], seq=seq) # Ctrl+V
             return True
         elif cmd in ("cut", "ctrl_x", "ctrl+x"):
-            self.send_key_combination([VK_CONTROL, 0x58]) # Ctrl+X
+            self.send_key_combination([VK_CONTROL, 0x58], seq=seq) # Ctrl+X
             return True
         elif cmd in ("select_all", "selectall", "ctrl_a", "ctrl+a"):
-            self.send_key_combination([VK_CONTROL, 0x41]) # Ctrl+A
+            self.send_key_combination([VK_CONTROL, 0x41], seq=seq) # Ctrl+A
             return True
         elif cmd in ("undo", "ctrl_z", "ctrl+z"):
-            self.send_key_combination([VK_CONTROL, 0x5A]) # Ctrl+Z
+            self.send_key_combination([VK_CONTROL, 0x5A], seq=seq) # Ctrl+Z
             return True
         elif cmd in ("redo", "ctrl_y", "ctrl+y"):
-            self.send_key_combination([VK_CONTROL, 0x59]) # Ctrl+Y
+            self.send_key_combination([VK_CONTROL, 0x59], seq=seq) # Ctrl+Y
             return True
         elif cmd in ("save", "ctrl_s", "ctrl+s"):
-            self.send_key_combination([VK_CONTROL, 0x53]) # Ctrl+S
+            self.send_key_combination([VK_CONTROL, 0x53], seq=seq) # Ctrl+S
             return True
         elif cmd in ("enter", "return"):
-            self.send_key_combination([0x0D])
+            self.send_key_combination([0x0D], seq=seq)
             return True
         elif cmd in ("backspace", "back"):
-            self.send_key_combination([0x08])
+            self.send_key_combination([0x08], seq=seq)
             return True
         elif cmd in ("tab",):
-            self.send_key_combination([VK_TAB])
+            self.send_key_combination([VK_TAB], seq=seq)
             return True
         elif cmd in ("esc", "escape"):
-            self.send_key_combination([VK_ESCAPE])
+            self.send_key_combination([VK_ESCAPE], seq=seq)
             return True
         elif cmd in ("delete", "del"):
-            self.send_key_combination([VK_DELETE])
+            self.send_key_combination([VK_DELETE], seq=seq)
             return True
         elif cmd in ("arrow_up", "up"):
-            self.send_key_combination([0x26])
+            self.send_key_combination([0x26], seq=seq)
             return True
         elif cmd in ("arrow_down", "down"):
-            self.send_key_combination([0x28])
+            self.send_key_combination([0x28], seq=seq)
             return True
         elif cmd in ("arrow_left", "left"):
-            self.send_key_combination([0x25])
+            self.send_key_combination([0x25], seq=seq)
             return True
         elif cmd in ("arrow_right", "right"):
-            self.send_key_combination([0x27])
+            self.send_key_combination([0x27], seq=seq)
             return True
         elif cmd in ("win_d", "wind"):
-            self.send_key_combination([VK_LWIN, 0x44]) # Win + D
+            self.send_key_combination([VK_LWIN, 0x44], seq=seq) # Win + D
             return True
         elif cmd in ("win_e", "wine"):
-            self.send_key_combination([VK_LWIN, 0x45]) # Win + E (Explorer)
+            self.send_key_combination([VK_LWIN, 0x45], seq=seq) # Win + E (Explorer)
             return True
         elif cmd in ("win_r", "winr"):
-            self.send_key_combination([VK_LWIN, 0x52]) # Win + R (Run)
+            self.send_key_combination([VK_LWIN, 0x52], seq=seq) # Win + R (Run)
             return True
         elif cmd in ("alt_tab", "alttab"):
-            self.send_key_combination([VK_MENU, VK_TAB]) # Alt + Tab
+            self.send_key_combination([VK_MENU, VK_TAB], seq=seq) # Alt + Tab
             return True
         elif cmd in ("alt_f4", "altf4"):
-            self.send_key_combination([VK_MENU, 0x73]) # Alt + F4
+            self.send_key_combination([VK_MENU, 0x73], seq=seq) # Alt + F4
             return True
         elif cmd in ("task_mgr", "taskmgr"):
-            self.send_key_combination([VK_CONTROL, VK_SHIFT, VK_ESCAPE]) # Ctrl+Shift+Esc
+            self.send_key_combination([VK_CONTROL, VK_SHIFT, VK_ESCAPE], seq=seq) # Ctrl+Shift+Esc
             return True
         elif cmd in ("lock", "lock_screen", "win_l"):
             if not is_test_environment() and self.user32 and hasattr(self.user32, "LockWorkStation"):
@@ -631,7 +982,7 @@ class InputHandler:
                     return True
                 except Exception:
                     pass
-            self.send_key_combination([VK_LWIN, 0x4C]) # Win + L
+            self.send_key_combination([VK_LWIN, 0x4C], seq=seq) # Win + L
             return True
         elif cmd in ("ctrl_alt_del", "sas"):
             if not is_test_environment():
@@ -642,8 +993,8 @@ class InputHandler:
                         return True
                 except Exception:
                     pass
-            self.send_key_combination([VK_CONTROL, VK_MENU, VK_DELETE])
+            self.send_key_combination([VK_CONTROL, VK_MENU, VK_DELETE], seq=seq)
             return True
 
         # Fallback to shortcut string
-        return self.send_shortcut(command)
+        return self.send_shortcut(command, seq=seq)
