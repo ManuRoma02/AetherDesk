@@ -2,8 +2,8 @@
 In-memory regression tests for Remote Input pipeline, Windows Privileges/UAC detection,
 and Video Telemetry / FPS diagnostics.
 
-NOTE: As per strict operational constraints, these tests are written for static verification
-and in-memory validation only; they are NOT to be executed at runtime.
+All input, desktop, and Windows API interactions in these tests are mocked. The tests can
+run as ordinary unit tests without sending input to or capturing the real desktop.
 """
 
 import sys
