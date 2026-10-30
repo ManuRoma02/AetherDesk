@@ -8,6 +8,7 @@
 # e hash crittografici verificati.
 
 Pillow>=10.0.0
+certifi>=2024.2.2
 cryptography>=41.0.0
 websockets>=12.0
 pywin32>=306; sys_platform == "win32"

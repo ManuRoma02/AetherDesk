@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import asyncio
 import hashlib
+import json
 import tempfile
 import platform
 import urllib.request
@@ -1123,6 +1124,47 @@ def test_check_github_update_multi_asset_selection(monkeypatch):
     is_newer_dupe, info_dupe = check_github_update(local_version="1.4.0", public_key_hex=pub_hex)
     assert is_newer_dupe is False
     assert "molteplici asset ambigui" in info_dupe.get("error", "")
+
+def test_verified_urlopen_uses_bundled_ca_only_after_system_certificate_failure(monkeypatch):
+    import ssl
+    from src.ota import _urlopen_verified
+
+    response = object()
+    seen_contexts = []
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen_contexts.append(context)
+        if context is None:
+            failure = ssl.SSLCertVerificationError(1, "certificate verify failed")
+            raise urllib.error.URLError(failure)
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+        return response
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    result = _urlopen_verified(urllib.request.Request("https://example.invalid"), timeout=6)
+
+    assert result is response
+    assert len(seen_contexts) == 2
+    assert seen_contexts[0] is None
+    assert seen_contexts[1] is not None
+
+
+def test_verified_urlopen_does_not_retry_other_network_errors(monkeypatch):
+    from src.ota import _urlopen_verified
+
+    calls = []
+
+    def fake_urlopen(req, timeout=None, context=None):
+        calls.append(context)
+        raise urllib.error.URLError("temporary network failure")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(urllib.error.URLError, match="temporary network failure"):
+        _urlopen_verified(urllib.request.Request("https://example.invalid"), timeout=6)
+
+    assert calls == [None]
+
 
 def test_apply_in_place_update_temp_cleanup_on_all_failures(tmp_path, monkeypatch):
     """

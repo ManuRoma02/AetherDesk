@@ -31,7 +31,7 @@ a = Analysis(
     datas=[('assets', 'assets'), ('scripts', 'scripts')],
     hiddenimports=[
         'PIL', 'PIL.Image', 'PIL.ImageTk', 'defusedxml', 'xml.etree.ElementTree',
-        'cryptography', 'websockets', 'win32clipboard', 'src.ota',
+        'certifi', 'cryptography', 'websockets', 'win32clipboard', 'src.ota',
         'src.host_tray', 'src.host_daemon', 'src.host_service', 'src.signaling_broker', 'src.capture',
         'src.input_handler', 'src.security', 'src.transfer', 'src.protocol', 'src.client', 'src.discovery', 'src.native_engine'
     ],

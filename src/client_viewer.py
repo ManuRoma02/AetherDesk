@@ -141,6 +141,7 @@ class ClientViewerGUI:
         self._center_window(self.root, 520, 680)
         self.root.configure(bg=THEME["bg"])
         self.root.resizable(False, False)
+        self._closing = False
         self.root.protocol("WM_DELETE_WINDOW", self._on_main_window_close)
 
         # Set official window icon
@@ -801,8 +802,26 @@ class ClientViewerGUI:
             self.root.after(1500, _revert_pwd_btn)
 
     def _on_main_window_close(self):
-        """Coordinated, deterministic shutdown of GUI, client, host daemon, and network threads."""
+        """Start shutdown off the Tk thread so the window stays responsive while closing."""
+        if self._closing:
+            return
+        self._closing = True
         logger.info("Main window closing, initiating clean shutdown sequence...")
+
+        self._close_complete = threading.Event()
+        self._close_thread = threading.Thread(target=self._shutdown_for_window_close, daemon=True)
+        self._close_thread.start()
+        self.root.after(50, self._poll_window_close)
+
+    def _shutdown_for_window_close(self):
+        """Stop network resources away from Tk's UI thread and signal when safe to destroy the root."""
+        try:
+            self._stop_resources_for_window_close()
+        finally:
+            self._close_complete.set()
+
+    def _stop_resources_for_window_close(self):
+        """Coordinated shutdown of the local host daemon, remote client, and their threads."""
 
         # 1. Stop host daemon if running
         if self.host_daemon:
@@ -846,9 +865,16 @@ class ClientViewerGUI:
             except Exception as e:
                 logger.warning(f"Network thread join error: {e}")
 
-        # 5. Cleanly destroy Tkinter root
+    def _poll_window_close(self):
+        """Destroy Tk only after background teardown finishes; never block the GUI thread."""
+        if self._close_complete.is_set():
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            return
         try:
-            self.root.destroy()
+            self.root.after(50, self._poll_window_close)
         except Exception:
             pass
 
@@ -1410,6 +1436,17 @@ class ClientViewerGUI:
         except Exception:
             pass
 
+    @staticmethod
+    def _format_update_check_error(error: str) -> str:
+        message = str(error)
+        if "certificate_verify_failed" in message.lower() or "certificate verify failed" in message.lower():
+            message += (
+                "\n\nControlla che data e ora di Windows siano corrette e che Windows sia aggiornato. "
+                "Se un antivirus o proxy ispeziona HTTPS, il suo certificato deve essere attendibile nel sistema. "
+                "La verifica TLS dell'aggiornamento resta sempre attiva."
+            )
+        return message
+
     def _check_git_updates_background(self, notify_if_none: bool = False, prompt_on_found: bool = False):
         try:
             def set_checking():
@@ -1472,7 +1509,8 @@ class ClientViewerGUI:
                         if notify_if_none:
                             messagebox.showwarning(
                                 "Controllo Aggiornamenti",
-                                f"Impossibile verificare gli aggiornamenti:\n{err}\n\nVerifica la connessione internet."
+                                "Impossibile verificare gli aggiornamenti:\n"
+                                f"{self._format_update_check_error(err)}\n\nVerifica la connessione internet."
                             )
                     else:
                         if self.btn_header_update:
@@ -1500,7 +1538,10 @@ class ClientViewerGUI:
                 if self.btn_git_update:
                     self.btn_git_update.config(text="🔄 Riprova Aggiornamento", state=tk.NORMAL, fg="#f87171")
                 if notify_if_none:
-                    messagebox.showwarning("Controllo Aggiornamenti", f"Errore durante la verifica:\n{e}")
+                    messagebox.showwarning(
+                        "Controllo Aggiornamenti",
+                        f"Errore durante la verifica:\n{self._format_update_check_error(e)}"
+                    )
             self._safe_after(0, err_ui)
 
     def _on_git_update_click(self):

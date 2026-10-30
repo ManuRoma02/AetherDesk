@@ -7,6 +7,8 @@ import logging
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
+import ssl
 import json
 import tempfile
 from enum import Enum
@@ -18,7 +20,7 @@ from cryptography.exceptions import InvalidSignature
 
 logger = logging.getLogger("OTA")
 
-CURRENT_VERSION = "1.5.1"
+CURRENT_VERSION = "1.5.2"
 GITHUB_REPO = "ManuRoma02/AetherDesk"
 
 # Embedded Vendor Public Key for OTA Manifest Verification (Ed25519, 32 bytes raw / 64 hex characters).
@@ -27,6 +29,55 @@ GITHUB_REPO = "ManuRoma02/AetherDesk"
 OTA_VENDOR_PUBLIC_KEY_HEX = "18e57b653337e30326f563ce282f1a185feb844e453540de039738738ee429b7"
 OTA_STAGING_DIR_NAME = "aether_ota_staging"
 OTA_TEMP_FILE_PREFIX = "aether_ota_"
+
+
+def _is_certificate_verification_error(exc: BaseException) -> bool:
+    """Return True only for TLS certificate-chain/hostname verification failures."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        message = str(current).lower()
+        if "certificate_verify_failed" in message or "certificate verify failed" in message:
+            return True
+        for attr in ("reason", "__cause__", "__context__"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+def _urlopen_verified(req, timeout: float):
+    """Use OS trust first, then bundled Mozilla roots if the OS CA path cannot verify TLS.
+
+    Both attempts require normal certificate-chain and hostname validation. This fallback
+    supports frozen clients whose Python runtime cannot find the machine CA bundle without
+    weakening TLS verification.
+    """
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except Exception as primary_error:
+        if not _is_certificate_verification_error(primary_error):
+            raise
+
+        try:
+            import certifi
+
+            ca_file = Path(certifi.where())
+            if not ca_file.is_file():
+                raise FileNotFoundError("Bundled CA certificate bundle is missing")
+            context = ssl.create_default_context(cafile=str(ca_file))
+            logger.warning("System CA validation failed; retrying HTTPS with bundled Mozilla CA roots.")
+            return urllib.request.urlopen(req, timeout=timeout, context=context)
+        except Exception as fallback_error:
+            if _is_certificate_verification_error(fallback_error):
+                raise fallback_error from primary_error
+            raise primary_error
 
 def get_ota_staging_dir() -> Path:
     """Returns the dedicated staging directory for OTA downloaded binaries."""
@@ -1091,7 +1142,7 @@ def check_github_update(
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with _urlopen_verified(req, timeout=6) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             tag = data.get("tag_name", "").lstrip("v")
             assets = data.get("assets", [])
@@ -1109,7 +1160,7 @@ def check_github_update(
             if manifest_url:
                 try:
                     m_req = urllib.request.Request(manifest_url, headers={"User-Agent": "AetherDesk-OTA-Client"})
-                    with urllib.request.urlopen(m_req, timeout=6) as m_resp:
+                    with _urlopen_verified(m_req, timeout=6) as m_resp:
                         raw_m = json.loads(m_resp.read().decode("utf-8"))
                         m_ok, m_msg = verify_update_manifest(raw_m, local_version=local_version, public_key_hex=public_key_hex)
                         if m_ok:
@@ -1267,7 +1318,7 @@ def download_github_binary(
         temp_path = tf.name
         tf.close()
 
-        with urllib.request.urlopen(req, timeout=45) as resp, open(temp_path, "wb") as f:
+        with _urlopen_verified(req, timeout=45) as resp, open(temp_path, "wb") as f:
             total_size = int(resp.headers.get("Content-Length", 0))
             received = 0
             while chunk := resp.read(65536):
